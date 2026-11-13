@@ -1,0 +1,46 @@
+{
+	"streams": [
+		{
+			"index": 0,
+			"codec_name": "h264",
+			"codec_type": "video",
+			"width": 1080,
+			"height": 1920,
+			"coded_width": 1080,
+			"coded_height": 1920,
+			"sample_aspect_ratio": "1:1",
+			"display_aspect_ratio": "16:9",
+			"pix_fmt": "yuv420p",
+			"r_frame_rate": "30/1",
+			"avg_frame_rate": "30/1",
+			"time_base": "1/90000",
+			"duration": "12.500000",
+			"disposition": {
+				"default": 1,
+				"attached_pic": 0
+			},
+			"profile": "High"
+		},
+		{
+			"index": 1,
+			"codec_name": "aac",
+			"codec_type": "audio",
+			"sample_rate": "48000",
+			"channels": 2,
+			"channel_layout": "stereo",
+			"duration": "12.500000",
+			"disposition": {
+				"default": 1,
+				"attached_pic": 0
+			}
+		}
+	],
+	"format": {
+		"filename": "/footage/DJI_20261101123456_0001_D.MP4",
+		"nb_streams": 2,
+		"format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+		"duration": "12.500000",
+		"size": "234567890",
+		"bit_rate": "150000000"
+	}
+}

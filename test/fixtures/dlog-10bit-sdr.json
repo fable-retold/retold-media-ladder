@@ -1,0 +1,42 @@
+{
+	"streams": [
+		{
+			"index": 0,
+			"codec_name": "hevc",
+			"codec_type": "video",
+			"width": 3840,
+			"height": 2160,
+			"coded_width": 3840,
+			"coded_height": 2160,
+			"sample_aspect_ratio": "1:1",
+			"display_aspect_ratio": "16:9",
+			"pix_fmt": "yuv420p10le",
+			"r_frame_rate": "25/1",
+			"avg_frame_rate": "25/1",
+			"time_base": "1/90000",
+			"duration": "12.500000",
+			"disposition": {
+				"default": 1,
+				"attached_pic": 0
+			},
+			"profile": "Main 10",
+			"color_transfer": "bt709",
+			"color_primaries": "bt709"
+		}
+	],
+	"format": {
+		"filename": "/footage/DJI_20261101123456_0001_D.MP4",
+		"nb_streams": 1,
+		"format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+		"duration": "12.500000",
+		"size": "234567890",
+		"bit_rate": "150000000",
+		"tags": {
+			"major_brand": "isom",
+			"creation_time": "2026-11-01T12:34:56.000000Z",
+			"location": "+37.7749-122.4194+010.000/",
+			"com.apple.quicktime.make": "DJI",
+			"encoder": "DJI Mini4 Pro"
+		}
+	}
+}

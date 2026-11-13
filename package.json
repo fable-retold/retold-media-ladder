@@ -1,0 +1,64 @@
+{
+  "name": "retold-media-ladder",
+  "version": "1.0.0",
+  "description": "Turn a video file into a private, adaptive-bitrate HLS package: probe, plan, one-pass ffmpeg encode (fMP4 single_file H.264 rungs, HLG/PQ tone-map, LUT, fps conform, portrait-aware), poster, faststart download, a metadata sanitise gate and a hashed package.json.",
+  "main": "source/Retold-Media-Ladder.js",
+  "bin": {
+    "media-ladder": "./bin/media-ladder.js"
+  },
+  "files": [
+    "source",
+    "bin"
+  ],
+  "scripts": {
+    "test": "npx quack test",
+    "coverage": "npx quack coverage",
+    "tests": "npx mocha -u tdd -R spec --exit test/*.js"
+  },
+  "mocha": {
+    "diff": true,
+    "extension": [
+      "js"
+    ],
+    "package": "./package.json",
+    "reporter": "spec",
+    "slow": "2000",
+    "timeout": "120000",
+    "ui": "tdd",
+    "watch-files": [
+      "source/**/*.js",
+      "test/**/*.js"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fable-retold/retold-media-ladder.git"
+  },
+  "keywords": [
+    "retold",
+    "ffmpeg",
+    "hls",
+    "abr",
+    "adaptive-bitrate",
+    "fmp4",
+    "video",
+    "encoding",
+    "tone-mapping",
+    "hlg"
+  ],
+  "author": "steven velozo <steven@velozo.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/fable-retold/retold-media-ladder/issues"
+  },
+  "homepage": "https://github.com/fable-retold/retold-media-ladder#readme",
+  "dependencies": {
+    "fable-serviceproviderbase": "^3.0.19"
+  },
+  "devDependencies": {
+    "chai": "^4.3.10",
+    "fable": "^3.1.83",
+    "mocha": "^10.4.0",
+    "quackage": "^1.3.0"
+  }
+}
