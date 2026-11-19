@@ -14,7 +14,9 @@
 * safely and that the token never leaks.  Packages are hand-built (they pass verifyPackage); one suite
 * also pushes a real lavfi-encoded package with `--source` probing, and
 * skips loudly when ffmpeg is not installed.  The CLI's general behaviour
-* (--version, --help, no command, the macOS-only --fast) is tested here too.
+* (--version, --help, no command, the macOS-only --fast, flag values that are
+* usage errors, and `plan`'s command line quoted for the platform's shell) is
+* tested here too, against a stand-in ffprobe and ffmpeg.
 *
 * @license MIT
 *
@@ -34,6 +36,8 @@ const libRetoldMediaLadder = require('../source/Retold-Media-Ladder.js');
 const libPublisher = require('../source/Publisher.js');
 const libPackageWriter = require('../source/Package-Writer.js');
 const libFakeServer = require('./support/Fake-Media-Ingest-Server.js');
+const libStandInFFmpeg = require('./support/Stand-In-FFmpeg.js');
+const libLadderPlanner = require('../source/Ladder-Planner.js');
 
 const BIN = libPath.join(__dirname, '..', 'bin', 'media-ladder.js');
 const TOKEN = 'exo_test-token-0123456789abcdef';
@@ -1525,18 +1529,43 @@ suite
 
 		suite
 		(
-			'the CLI: --version, --help, no arguments and the macOS-only --fast',
+			'the CLI: --version, --help, no arguments, the macOS-only --fast, flag values and the plan command line',
 			function ()
 			{
 				/** Run the CLI in a process whose process.platform reads pPlatform (a preload swaps it). */
-				let fRunAs = (pPlatform, pArguments, fCallback) =>
+				let fRunAs = (pPlatform, pArguments, pEnvironment, fCallback) =>
 				{
+					if (typeof pEnvironment === 'function')
+					{
+						fCallback = pEnvironment;
+						pEnvironment = {};
+					}
 					let tmpPreload = libPath.join(tmpScratch, `pretend-${pPlatform}.js`);
 					libFS.writeFileSync(tmpPreload, `Object.defineProperty(process, 'platform', { value: ${JSON.stringify(pPlatform)} });\n`);
-					return libChildProcess.execFile(process.execPath, ['-r', tmpPreload, BIN].concat(pArguments), { env: cleanEnvironment() }, (pError, pStdout, pStderr) =>
+					return libChildProcess.execFile(process.execPath, ['-r', tmpPreload, BIN].concat(pArguments), { env: cleanEnvironment(pEnvironment) }, (pError, pStdout, pStderr) =>
 						{
 							return fCallback((pError && typeof pError.code === 'number') ? pError.code : (pError ? -1 : 0), String(pStdout), String(pStderr));
 						});
+				};
+
+				/**
+				 * The environment for a stand-in ffprobe that answers every probe with a fixture (so any file
+				 * "probes" as that source) and a stand-in ffmpeg that lists everything the ladder can use, at a
+				 * path with a space in it.
+				 */
+				let fStandIns = () =>
+				{
+					let tmpDirectory = libPath.join(tmpScratch, 'stand ins');
+					let tmpFFprobe = libPath.join(tmpDirectory, 'ffprobe');
+					let tmpFFmpeg = libPath.join(tmpDirectory, 'ffmpeg');
+					if (!libFS.existsSync(tmpFFprobe))
+					{
+						libFS.mkdirSync(tmpDirectory, { recursive: true });
+						libFS.writeFileSync(tmpFFprobe, [`#!${process.execPath}`, `process.stdout.write(${JSON.stringify(libFS.readFileSync(libPath.join(__dirname, 'fixtures', 'source-720p.json'), 'utf8'))});`, ''].join('\n'));
+						libFS.chmodSync(tmpFFprobe, 0o755);
+						libStandInFFmpeg.writeStandInFFmpeg(tmpFFmpeg);
+					}
+					return { FFprobe: tmpFFprobe, FFmpeg: tmpFFmpeg, Environment: { RETOLD_MEDIA_LADDER_FFPROBE: tmpFFprobe, RETOLD_MEDIA_LADDER_FFMPEG: tmpFFmpeg } };
 				};
 
 				test
@@ -1576,6 +1605,12 @@ suite
 								Expect(pStdout).to.contain('Usage:');
 								Expect(pStdout.split('\n')).to.include('  --fast                  encode with h264_videotoolbox instead of x264 (macOS only)');
 								Expect(pStdout.split('\n')).to.include('  -V, --version           print the version and exit');
+								// Every value --preset, --profile and --segment-seconds accepts is in the usage.
+								Expect(pStdout).to.contain(
+									'  --preset <name>         x264 preset (default medium): ultrafast, superfast, veryfast,\n'
+									+ '                          faster, fast, medium, slow, slower, veryslow or placebo\n');
+								Expect(pStdout.split('\n')).to.include('  --profile <name>        standard (default) or hq (caps 1080p at 7800k, not 6000k)');
+								Expect(pStdout.split('\n')).to.include('  --segment-seconds <n>   HLS segment length in whole seconds, 1 to 60 (default 6)');
 								runCLI(['encode', '-h'], {}, guard(fDone, (pHelpCode, pHelpStdout, pHelpStderr) =>
 									{
 										Expect(pHelpCode, pHelpStderr).to.equal(0);
@@ -1605,7 +1640,7 @@ suite
 					(fDone) =>
 					{
 						let libCLI = require('../bin/media-ladder.js');
-						let tmpReason = '--fast uses h264_videotoolbox, which is only available on macOS.';
+						let tmpReason = 'Fast encoding (--fast / Fast: true) uses h264_videotoolbox, which is only available on macOS.';
 						Expect(() => libCLI.ladderOptions({ '--fast': true }, 'linux')).to.throw(tmpReason);
 						Expect(() => libCLI.ladderOptions({ '--fast': true }, 'win32')).to.throw(tmpReason);
 						Expect(libCLI.ladderOptions({ '--fast': true, '--out': 'packages' }, 'darwin')).to.deep.equal({ Fast: true, OutputDirectory: 'packages' });
@@ -1634,6 +1669,198 @@ suite
 												fDone();
 											}));
 									}));
+							}));
+					}
+				);
+
+				test
+				(
+					'a malformed --segment-seconds, --preset or --profile is a usage error (exit 2) naming the flag, before any probing; a missing file stays a failure (exit 1)',
+					(fDone) =>
+					{
+						let libCLI = require('../bin/media-ladder.js');
+						let tmpPresets = 'ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo';
+						let tmpBad =
+						[
+							[{ '--segment-seconds': '61' }, '--segment-seconds must be a whole number from 1 to 60 (got 61).'],
+							[{ '--segment-seconds': '2.5' }, '--segment-seconds must be a whole number from 1 to 60 (got 2.5).'],
+							[{ '--segment-seconds': '0' }, '--segment-seconds must be a whole number from 1 to 60 (got 0).'],
+							[{ '--segment-seconds': 'six' }, '--segment-seconds must be a whole number from 1 to 60 (got six).'],
+							[{ '--segment-seconds': '6.5' }, '--segment-seconds must be a whole number from 1 to 60 (got 6.5).'],
+							[{ '--segment-seconds': '0x6' }, '--segment-seconds must be a whole number from 1 to 60 (got 0x6).'],
+							[{ '--segment-seconds': '6e0' }, '--segment-seconds must be a whole number from 1 to 60 (got 6e0).'],
+							[{ '--segment-seconds': '60.01' }, '--segment-seconds must be a whole number from 1 to 60 (got 60.01).'],
+							[{ '--preset': 'bogus' }, `--preset must be one of ${tmpPresets} (got bogus).`],
+							// A value is echoed printable: it can hold anything.
+							[{ '--preset': 'x\x1b[2Ky' }, `--preset must be one of ${tmpPresets} (got x\\u001b[2Ky).`],
+							[{ '--profile': 'foo' }, '--profile must be one of standard, hq (got foo).']
+						];
+						tmpBad.forEach((pCase) =>
+							{
+								Expect(() => libCLI.ladderOptions(pCase[0], 'darwin'), pCase[1]).to.throw(pCase[1]);
+							});
+						Expect(libCLI.ladderOptions({ '--segment-seconds': '1', '--preset': 'placebo', '--profile': 'standard' }, 'linux')).to.deep.equal({ SegmentSeconds: 1, Preset: 'placebo', Profile: 'standard' });
+						Expect(libCLI.ladderOptions({ '--segment-seconds': '60', '--preset': 'ultrafast', '--profile': 'hq' }, 'linux')).to.deep.equal({ SegmentSeconds: 60, Preset: 'ultrafast', Profile: 'hq' });
+						// A whole number written with a zero fraction is still one (1.0.0 took "6.0").
+						Expect(libCLI.ladderOptions({ '--segment-seconds': '6.0' }, 'linux')).to.deep.equal({ SegmentSeconds: 6 });
+						Expect(libCLI.ladderOptions({ '--segment-seconds': '060.00' }, 'linux')).to.deep.equal({ SegmentSeconds: 60 });
+
+						let tmpStandIns = fStandIns();
+						let tmpSource = libPath.join(tmpScratch, 'flag-value-source.mp4');
+						libFS.writeFileSync(tmpSource, 'stands in for a video: the stand-in ffprobe answers for it');
+						let tmpOutput = libPath.join(tmpScratch, 'flag-value-out');
+						let tmpRuns =
+						[
+							[['plan', tmpSource, '--segment-seconds', '61'], 2, 'media-ladder: --segment-seconds must be a whole number from 1 to 60 (got 61).\n'],
+							[['encode', tmpSource, '--out', tmpOutput, '--segment-seconds=2.5'], 2, 'media-ladder: --segment-seconds must be a whole number from 1 to 60 (got 2.5).\n'],
+							[['encode', tmpSource, '--out', tmpOutput, '--preset', 'bogus'], 2, `media-ladder: --preset must be one of ${tmpPresets} (got bogus).\n`],
+							[['plan', tmpSource, '--profile', 'foo'], 2, 'media-ladder: --profile must be one of standard, hq (got foo).\n'],
+							// Runtime failures stay exit 1: a missing source, a missing LUT.
+							[['plan', libPath.join(tmpScratch, 'no-such-source.mp4'), '--segment-seconds', '60'], 1, `media-ladder: Input file not found: ${libPath.join(tmpScratch, 'no-such-source.mp4')}\n`],
+							[['plan', tmpSource, '--lut', libPath.join(tmpScratch, 'no-such.cube')], 1, `media-ladder: LUT file not found: ${libPath.join(tmpScratch, 'no-such.cube')}\n`]
+						];
+						let fNext = (pIndex) =>
+						{
+							if (pIndex >= tmpRuns.length)
+							{
+								Expect(libFS.existsSync(tmpOutput)).to.equal(false);
+								return fDone();
+							}
+							let tmpRun = tmpRuns[pIndex];
+							fRunAs('darwin', tmpRun[0], tmpStandIns.Environment, guard(fDone, (pCode, pStdout, pStderr) =>
+								{
+									Expect(pCode, `${tmpRun[0].join(' ')}: ${pStderr}`).to.equal(tmpRun[1]);
+									Expect(pStderr).to.equal(tmpRun[2]);
+									Expect(pStdout).to.equal('');
+									fNext(pIndex + 1);
+								}));
+						};
+						fNext(0);
+					}
+				);
+
+				test
+				(
+					'probe ignores --fast on every platform (it never encodes); plan and encode still refuse it off macOS',
+					(fDone) =>
+					{
+						let tmpStandIns = fStandIns();
+						let tmpSource = libPath.join(tmpScratch, 'probe-fast-source.mp4');
+						libFS.writeFileSync(tmpSource, 'stands in for a video: the stand-in ffprobe answers for it');
+						let tmpPlatforms = ['linux', 'win32', 'darwin'];
+						let fNext = (pIndex) =>
+						{
+							if (pIndex >= tmpPlatforms.length)
+							{
+								return fRunAs('linux', ['plan', tmpSource, '--fast'], tmpStandIns.Environment, guard(fDone, (pPlanCode, pPlanStdout, pPlanStderr) =>
+									{
+										Expect(pPlanCode, pPlanStderr).to.equal(2);
+										Expect(pPlanStderr).to.equal('media-ladder: Fast encoding (--fast / Fast: true) uses h264_videotoolbox, which is only available on macOS.\n');
+										Expect(pPlanStdout).to.equal('');
+										fDone();
+									}));
+							}
+							fRunAs(tmpPlatforms[pIndex], ['probe', tmpSource, '--fast'], tmpStandIns.Environment, guard(fDone, (pCode, pStdout, pStderr) =>
+								{
+									Expect(pCode, `${tmpPlatforms[pIndex]}: ${pStderr}`).to.equal(0);
+									Expect(pStderr).to.equal('');
+									let tmpSummary = JSON.parse(pStdout);
+									Expect(tmpSummary.Video.DisplayWidth).to.equal(1280);
+									Expect(tmpSummary.Raw).to.equal(undefined);
+									fNext(pIndex + 1);
+								}));
+						};
+						fNext(0);
+					}
+				);
+
+				test
+				(
+					'plan prints the ffmpeg command line for the platform\'s shell: cmd.exe quoting on Windows, POSIX quoting elsewhere',
+					(fDone) =>
+					{
+						let tmpStandIns = fStandIns();
+						let tmpSource = libPath.join(tmpScratch, 'plan-command source (1).mp4');
+						libFS.writeFileSync(tmpSource, 'stands in for a video: the stand-in ffprobe answers for it');
+						let tmpLut = libPath.join(tmpScratch, "it's,[odd];.cube");
+						libFS.writeFileSync(tmpLut, 'LUT_3D_SIZE 2\n');
+						let fPlan = (pPlatform, fCheck) =>
+						{
+							fRunAs(pPlatform, ['plan', tmpSource, '--lut', tmpLut], tmpStandIns.Environment, guard(fDone, (pCode, pStdout, pStderr) =>
+								{
+									Expect(pCode, `${pPlatform}: ${pStderr}`).to.equal(0);
+									Expect(pStderr).to.equal('');
+									let tmpOutput = JSON.parse(pStdout);
+									let tmpArguments = libLadderPlanner.buildEncodeArguments(tmpOutput.Plan, tmpSource);
+									Expect(tmpOutput.Plan.Colour.Lut.File).to.equal(tmpLut);
+									fCheck(tmpOutput.Command, tmpArguments);
+								}));
+						};
+						fPlan('win32', (pWindowsCommand, pWindowsArguments) =>
+							{
+								Expect(pWindowsCommand).to.equal(libLadderPlanner.formatCommandLine(tmpStandIns.FFmpeg, pWindowsArguments, 'win32'));
+								Expect(pWindowsCommand).to.not.equal(libLadderPlanner.formatCommandLine(tmpStandIns.FFmpeg, pWindowsArguments));
+								Expect(pWindowsCommand.indexOf(`"${tmpStandIns.FFmpeg}" `)).to.equal(0);
+								Expect(pWindowsCommand).to.contain(` -i "${tmpSource}" `);
+								Expect(pWindowsCommand).to.contain(' -force_key_frames "expr:gte(t,n_forced*2)" ');
+								fPlan('linux', (pPosixCommand, pPosixArguments) =>
+									{
+										Expect(pPosixCommand).to.equal(libLadderPlanner.formatCommandLine(tmpStandIns.FFmpeg, pPosixArguments));
+										Expect(pPosixCommand.indexOf(`'${tmpStandIns.FFmpeg}' `)).to.equal(0);
+										Expect(pPosixCommand).to.contain(" -force_key_frames 'expr:gte(t,n_forced*2)' ");
+										fDone();
+									});
+							});
+					}
+				);
+
+				test
+				(
+					'plan prints JSON, so the README says to decode its Command string before pasting it: the decodings it gives recover the line, which as printed is JSON-escaped',
+					(fDone) =>
+					{
+						let tmpReadme = libFS.readFileSync(libPath.join(__dirname, '..', 'README.md'), 'utf8');
+						Expect(libFS.readFileSync(libPath.join(__dirname, '..', 'docs', 'README.md'), 'utf8'), 'docs/README.md is a copy of README.md').to.equal(tmpReadme);
+						// The command-line section's paragraph on what plan prints.
+						let tmpParagraphs = tmpReadme.split(/\n[ \t]*\n/).filter((pBlock) => /^`plan` /.test(pBlock));
+						Expect(tmpParagraphs).to.have.length(1);
+						let tmpParagraph = tmpParagraphs[0].replace(/\s+/g, ' ');
+						let tmpJq = /`media-ladder plan \S+ \| jq -r \.([A-Za-z]+)`/.exec(tmpParagraph);
+						let tmpPowerShell = /`\(media-ladder plan \S+ \| ConvertFrom-Json\)\.([A-Za-z]+)`/.exec(tmpParagraph);
+						Expect(tmpJq, `the README gives a jq decoding: ${tmpParagraph}`).to.not.equal(null);
+						Expect(tmpPowerShell, `the README gives a PowerShell decoding: ${tmpParagraph}`).to.not.equal(null);
+						Expect(tmpParagraph).to.contain('in a `.bat` or `.cmd` file');
+						let tmpStandIns = fStandIns();
+						let tmpSource = libPath.join(tmpScratch, 'paste source (2).mp4');
+						libFS.writeFileSync(tmpSource, 'stands in for a video: the stand-in ffprobe answers for it');
+						fRunAs('win32', ['plan', tmpSource], tmpStandIns.Environment, guard(fDone, (pCode, pStdout, pStderr) =>
+							{
+								Expect(pCode, pStderr).to.equal(0);
+								let tmpOutput = JSON.parse(pStdout);
+								let tmpLine = libLadderPlanner.formatCommandLine(tmpStandIns.FFmpeg, libLadderPlanner.buildEncodeArguments(tmpOutput.Plan, tmpSource), 'win32');
+								// What both of the README's decodings read is the cmd.exe line ...
+								Expect(tmpOutput[tmpJq[1]]).to.equal(tmpLine);
+								Expect(tmpOutput[tmpPowerShell[1]]).to.equal(tmpLine);
+								// ... which is not on stdout as it stands: JSON escaped its quotes (the spaced ffmpeg path,
+								// the input, -force_key_frames' parentheses), so pasting the printed text would break it.
+								Expect(tmpLine).to.contain(' -force_key_frames "expr:gte(t,n_forced*2)" ');
+								Expect(pStdout).to.not.contain(tmpLine);
+								Expect(pStdout).to.contain(JSON.stringify(tmpLine));
+								// The ladder's v%v paths are why a .bat or .cmd file must double each %.
+								Expect(tmpLine).to.contain(' v%v/media.mp4 ');
+								// The README's own pipeline, where jq is installed: jq -r prints the line itself.
+								let tmpJqProcess = libChildProcess.execFile('jq', ['-r', `.${tmpJq[1]}`], guard(fDone, (pJqError, pJqStdout) =>
+									{
+										if (pJqError && pJqError.code === 'ENOENT')
+										{
+											return fDone();
+										}
+										Expect(pJqError).to.equal(null);
+										Expect(String(pJqStdout)).to.equal(`${tmpLine}\n`);
+										fDone();
+									}));
+								tmpJqProcess.stdin.on('error', () => {});
+								tmpJqProcess.stdin.end(pStdout);
 							}));
 					}
 				);
@@ -1734,6 +1961,54 @@ suite
 								}));
 						};
 						fNext(0);
+					}
+				);
+
+				test
+				(
+					'a bad --server, --token or --prefix (or MEDIA_LADDER_SERVER / _TOKEN) is a usage error naming where it came from, never echoing it; a missing --source is a failure (exit 1)',
+					(fDone) =>
+					{
+						let libCLI = require('../bin/media-ladder.js');
+						let fUsage = (pFlags, pEnvironment) =>
+						{
+							try
+							{
+								libCLI.pushOptions(pFlags, pEnvironment);
+							}
+							catch (pError)
+							{
+								return pError.message;
+							}
+							throw new Error('no usage error');
+						};
+						let tmpGood = { MEDIA_LADDER_SERVER: 'https://env.example', MEDIA_LADDER_TOKEN: 'env-token' };
+						Expect(fUsage({ '--server': 'ftp://x' }, tmpGood)).to.equal('--server: The server URL must start with http:// or https://.');
+						Expect(fUsage({}, { MEDIA_LADDER_SERVER: 'ftp://x', MEDIA_LADDER_TOKEN: 'env-token' })).to.equal('MEDIA_LADDER_SERVER: The server URL must start with http:// or https://.');
+						let tmpCredentials = fUsage({ '--server': 'https://user:secret-pass@x' }, tmpGood);
+						Expect(tmpCredentials).to.equal('--server: The server URL must not carry credentials; pass a token instead.');
+						Expect(fUsage({ '--token': 'two words' }, tmpGood)).to.equal('--token: The token contains characters that cannot be sent in a header.');
+						Expect(fUsage({}, { MEDIA_LADDER_SERVER: 'https://env.example', MEDIA_LADDER_TOKEN: 'env token' })).to.equal('MEDIA_LADDER_TOKEN: The token contains characters that cannot be sent in a header.');
+						Expect(fUsage({ '--prefix': 'nope' }, tmpGood)).to.equal('--prefix: The prefix must be a path such as /1.0/MediaIngest.');
+
+						let tmpEnvironment = { MEDIA_LADDER_SERVER: tmpServer.BaseURL, MEDIA_LADDER_TOKEN: TOKEN };
+						runCLI(['push', tmpPackage.Directory, '--server', 'https://user:secret-pass@x'], tmpEnvironment, guard(fDone, (pCode, pStdout, pStderr) =>
+							{
+								Expect(pCode, pStderr).to.equal(2);
+								Expect(pStderr.indexOf('media-ladder: --server: The server URL must not carry credentials; pass a token instead.\n')).to.equal(0);
+								Expect(pStderr).to.not.contain('secret-pass');
+								Expect(pStdout).to.equal('');
+								let tmpMissing = libPath.join(tmpScratch, 'no-such-original.mov');
+								runCLI(['push', tmpPackage.Directory, '--source', tmpMissing], tmpEnvironment, guard(fDone, (pSourceCode, pSourceStdout, pSourceStderr) =>
+									{
+										Expect(pSourceCode, pSourceStderr).to.equal(1);
+										Expect(pSourceStderr).to.contain(tmpMissing);
+										Expect(pSourceStderr).to.not.contain('Usage:');
+										Expect(pSourceStdout).to.equal('');
+										Expect(tmpServer.Log.length).to.equal(0);
+										fDone();
+									}));
+							}));
 					}
 				);
 

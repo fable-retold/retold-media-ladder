@@ -3,13 +3,18 @@
 *
 * Turns a video file into a private, adaptive-bitrate HLS package on disk:
 *
-*   probe -> hash source -> plan -> PackageVersion -> (an existing <out>/<PV>/
-*   is verified and reused) -> lock + one-pass ffmpeg encode (into
-*   <out>/<PV>.partial/) -> master reorder -> poster -> download.mp4 ->
-*   sanitise gate -> package.json -> rename to <out>/<PV>/
+*   probe -> plan -> ffmpeg preflight (it runs, and has every encoder, filter
+*   and hwaccel the plan uses) -> hash source -> PackageVersion -> (an
+*   existing <out>/<PV>/ is verified and reused) -> lock + one-pass ffmpeg
+*   encode (into <out>/<PV>.partial/) -> master reorder -> poster ->
+*   download.mp4 -> sanitise gate -> package.json -> rename to <out>/<PV>/
 *
 * and pushes a finished package to a server (`push`, the Publisher service:
 * verify -> register -> resumable chunked upload -> commit).
+*
+* Everything that can refuse an encode (a bad flag, an ffmpeg without
+* libx264, say) does so before the source is hashed: a multi-GB source on a
+* slow disk takes minutes to hash.
 *
 * A finished package is immutable: it is never re-encoded in place, because a
 * re-encode with the same inputs (the same PackageVersion) does not reproduce
@@ -159,11 +164,126 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 	}
 
 	/**
-	 * Probe and plan (no encode).
+	 * What the runs of an encode need from the ffmpeg build -- the ladder
+	 * encode, the poster and (unless the plan skips it) the download remux --
+	 * read from the argument lists they will run with.
+	 *
+	 * @param {Object} pPlan
+	 * @param {string} pInputPath
+	 * @returns {Object} { Encoders, Filters, Hwaccels } (see Tools.capabilityRequirements)
+	 */
+	ffmpegRequirements(pPlan, pInputPath)
+	{
+		let tmpInput = String(pInputPath || 'input');
+		let tmpArgumentLists =
+		[
+			this.LadderPlanner.buildEncodeArguments(pPlan, tmpInput),
+			libPosterBuilder.buildPosterArguments(pPlan, tmpInput, libPosterBuilder.POSTER_FILE)
+		];
+		if (pPlan.Download)
+		{
+			tmpArgumentLists.push(libDownloadBuilder.buildDownloadArguments(pPlan.Rungs[0].File, libDownloadBuilder.DOWNLOAD_FILE));
+		}
+		return libTools.capabilityRequirements(tmpArgumentLists);
+	}
+
+	/**
+	 * Check, before anything slow, that this ffmpeg can run a plan: it runs
+	 * (`ffmpeg -version`, whose first line also keys the PackageVersion), and
+	 * it lists every encoder, filter and hwaccel ffmpegRequirements names
+	 * (`-encoders`, `-filters`, `-hwaccels`, listed once per ffmpeg path per
+	 * process).  A version below 7 is a warning, never a refusal.
+	 *
+	 * @param {Object} pPlan
+	 * @param {string} pInputPath
+	 * @param {function} fCallback - (pError, { FFmpeg, Version, Major, Runnable, Required, Missing, Message, Warnings });
+	 *   pError only when ffmpeg cannot be run or listed (or the check was cancelled: `.Cancelled = true`),
+	 *   with the report so far when the plan's requirements could be read (Runnable true once -version ran).
+	 *   Missing is [{ Kind: 'encoder' | 'filter' | 'hwaccel', Name }] and Message the one sentence naming
+	 *   them (null when nothing is missing); Warnings holds the older-version warning.
+	 * @returns {Object} handle { cancel(pImmediate) }
+	 */
+	preflight(pPlan, pInputPath, fCallback)
+	{
+		let tmpFFmpeg = this.binaries.FFmpeg;
+		let tmpReport = { FFmpeg: tmpFFmpeg, Version: null, Major: null, Runnable: false, Required: null, Missing: [], Message: null, Warnings: [] };
+		let tmpState = { Current: null, Cancelled: false, Finished: false };
+		let fFinish = (pError, pReport) =>
+		{
+			if (tmpState.Finished)
+			{
+				return;
+			}
+			tmpState.Finished = true;
+			return fCallback(pError, pReport);
+		};
+		try
+		{
+			tmpReport.Required = this.ffmpegRequirements(pPlan, pInputPath);
+		}
+		catch (pRequirementsError)
+		{
+			setImmediate(() => fFinish(pRequirementsError));
+			return libTools.inertHandle();
+		}
+		tmpState.Current = libTools.ffmpegVersion(tmpFFmpeg, (pVersionError, pVersionLine) =>
+			{
+				if (pVersionError || tmpState.Cancelled)
+				{
+					return fFinish(tmpState.Cancelled ? libTools.cancelledError() : pVersionError, tmpReport);
+				}
+				tmpReport.Version = pVersionLine;
+				tmpReport.Major = libTools.parseFFmpegMajorVersion(pVersionLine);
+				tmpReport.Runnable = true;
+				let tmpOlder = libTools.olderFFmpegWarning(tmpFFmpeg, pVersionLine);
+				if (tmpOlder)
+				{
+					tmpReport.Warnings.push(tmpOlder);
+				}
+				tmpState.Current = libTools.checkFFmpegCapabilities(tmpFFmpeg, tmpReport.Required, (pCheckError, pMissing) =>
+					{
+						if (pCheckError || tmpState.Cancelled)
+						{
+							return fFinish(tmpState.Cancelled ? libTools.cancelledError() : pCheckError, tmpReport);
+						}
+						tmpReport.Missing = pMissing;
+						if (pMissing.length > 0)
+						{
+							tmpReport.Message = libTools.describeMissingCapabilities(tmpFFmpeg, pVersionLine, pMissing);
+						}
+						return fFinish(null, tmpReport);
+					});
+			});
+		return (
+			{
+				cancel: (pImmediate) =>
+				{
+					if (tmpState.Finished)
+					{
+						return false;
+					}
+					tmpState.Cancelled = true;
+					if (tmpState.Current)
+					{
+						tmpState.Current.cancel(pImmediate);
+					}
+					return true;
+				}
+			});
+	}
+
+	/**
+	 * Probe and plan (no encode).  Never fails over the ffmpeg build: what
+	 * the preflight finds (a missing encoder, filter or hwaccel; an ffmpeg
+	 * that does not run; one older than 7.x) is appended to Plan.Warnings and
+	 * reported in Preflight, so a plan can be made on a box that cannot encode.
 	 *
 	 * @param {string} pInputPath
 	 * @param {Object} pOptions - planner flags (see LadderPlanner.planLadder)
-	 * @param {function} fCallback - (pError, { Probe, Plan, Arguments, CommandLine })
+	 * @param {function} fCallback - (pError, { Probe, Plan, Arguments, CommandLine, Preflight })
+	 *   Preflight: { FFmpeg, Version, Major, Runnable, Required, Missing, Message, Warnings } (see preflight);
+	 *   Message is also the reason when ffmpeg does not run (Runnable false) or cannot list its
+	 *   encoders, filters and hwaccels (Runnable true, Version set)
 	 */
 	plan(pInputPath, pOptions, fCallback)
 	{
@@ -197,12 +317,29 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 							return fCallback(pPlanError);
 						}
 						let tmpArguments = this.LadderPlanner.buildEncodeArguments(tmpPlan, tmpInput);
-						return fCallback(null,
+						this.preflight(tmpPlan, tmpInput, (pPreflightError, pReport) =>
 							{
-								Probe: pSummary,
-								Plan: tmpPlan,
-								Arguments: tmpArguments,
-								CommandLine: libLadderPlanner.formatCommandLine(this.binaries.FFmpeg, tmpArguments)
+								let tmpPreflight = pReport;
+								if (pPreflightError)
+								{
+									// An ffmpeg that does not run, or cannot list what it has, cannot encode,
+									// but the plan still stands; keep what the preflight did learn.
+									tmpPreflight = pReport || { FFmpeg: this.binaries.FFmpeg, Version: null, Major: null, Runnable: false, Required: null, Missing: [], Message: null, Warnings: [] };
+									tmpPreflight.Message = pPreflightError.message;
+								}
+								tmpPreflight.Warnings.forEach((pWarning) => { tmpPlan.Warnings.push(pWarning); });
+								if (tmpPreflight.Message)
+								{
+									tmpPlan.Warnings.push(tmpPreflight.Message);
+								}
+								return fCallback(null,
+									{
+										Probe: pSummary,
+										Plan: tmpPlan,
+										Arguments: tmpArguments,
+										CommandLine: libLadderPlanner.formatCommandLine(this.binaries.FFmpeg, tmpArguments),
+										Preflight: tmpPreflight
+									});
 							});
 					});
 			});
@@ -255,9 +392,13 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 	 *                               Fast is macOS only: elsewhere the encode fails before probing)
 	 *   - Force {boolean}           rebuild an existing package that fails verification (an intact one is
 	 *                               never replaced: delete it to re-encode)
-	 *   - onProgress {function}     ({ Phase, Percent, Message })
+	 *   - onProgress {function}     ({ Phase, Percent, Message }); phases probe, preflight, hash, plan, verify,
+	 *                               encode, poster, download, sanitise, package, done
 	 * @param {function} fCallback - (pError, { PackageVersion, PackageDirectory, Package, Plan, Warnings, Reused });
-	 *   a cancel yields an Error with `.Cancelled = true`; another live encode of the same package, `.InProgress = true`
+	 *   a cancel yields an Error with `.Cancelled = true`; another live encode of the same package, `.InProgress = true`;
+	 *   an ffmpeg without an encoder, filter or hwaccel the plan uses, `.Capability = true` with `.Missing`
+	 *   ([{ Kind, Name }]), `.FFmpeg` and `.FFmpegVersion` -- before the source is hashed or anything is written
+	 *   (an ffmpeg older than 7.x only adds a warning to Warnings)
 	 * @returns {Object} handle { cancel(), abort() } -- cancel() stops the running step (SIGTERM, then SIGKILL)
 	 *   and cleans up asynchronously; abort() SIGKILLs it, removes the partial package and calls back at once
 	 */
@@ -365,7 +506,8 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 		// A tiny sequential step runner; every step checks for cancellation.
 		let tmpSteps =
 		[
-			// 1. Probe.
+			// 1. Probe, and plan: a bad flag fails here, before any hashing.  (The
+			//    plan needs no hash; the LUT's digest goes into it at step 4.)
 			(fNext) =>
 			{
 				fProgress('probe', 0, 'Probing the source');
@@ -376,14 +518,13 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 							return fNext(pError);
 						}
 						tmpContext.Probe = pSummary;
-						// Fail fast on bad flags before spending time hashing a large source.
 						if (tmpOptions.Lut && !libFS.existsSync(tmpOptions.Lut))
 						{
 							return fNext(new Error(`LUT file not found: ${tmpOptions.Lut}`));
 						}
 						try
 						{
-							this.LadderPlanner.plan(pSummary, tmpOptions);
+							tmpContext.Plan = this.LadderPlanner.plan(pSummary, tmpOptions);
 						}
 						catch (pPlanError)
 						{
@@ -392,7 +533,29 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 						return fNext();
 					});
 			},
-			// 2. Hash the source and any LUT (they key the PackageVersion).
+			// 2. Preflight: ffmpeg runs, and has every encoder, filter and hwaccel the
+			//    plan will use -- found out now, not after hashing a multi-GB source.
+			(fNext) =>
+			{
+				fProgress('preflight', 0, 'Checking ffmpeg');
+				tmpState.Current = this.preflight(tmpContext.Plan, tmpInput, (pError, pReport) =>
+					{
+						if (pError)
+						{
+							return fNext(pError);
+						}
+						if (pReport.Missing.length > 0)
+						{
+							return fNext(libTools.capabilityError(pReport.FFmpeg, pReport.Version, pReport.Missing));
+						}
+						tmpContext.Preflight = pReport;
+						// Warn now, before a long hash: the plan's own warnings (step 4's plan
+						// has the same ones; the LUT digest changes none) and the preflight's.
+						tmpContext.Plan.Warnings.concat(pReport.Warnings).forEach((pWarning) => { this.log.warn(`media-ladder: ${pWarning}`); });
+						return fNext();
+					});
+			},
+			// 3. Hash the source and any LUT (they key the PackageVersion).
 			(fNext) =>
 			{
 				fProgress('hash', 0, 'Hashing the source');
@@ -406,7 +569,9 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 						tmpState.Current = this._hashLut(tmpOptions, fNext);
 					});
 			},
-			// 3. Plan, ffmpeg version, PackageVersion.
+			// 4. Plan again (now carrying the LUT's digest), PackageVersion: the plan,
+			//    the preflight's `ffmpeg -version` line and the source digest, exactly
+			//    as 1.0.0 computed it, so a re-run reuses a package made by 1.0.0.
 			(fNext) =>
 			{
 				try
@@ -417,22 +582,17 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 				{
 					return fNext(pPlanError);
 				}
-				tmpContext.Plan.Warnings.forEach((pWarning) => { this.log.warn(`media-ladder: ${pWarning}`); });
-				tmpState.Current = libTools.ffmpegVersion(this.binaries.FFmpeg, (pError, pVersion) =>
-					{
-						if (pError)
-						{
-							return fNext(pError);
-						}
-						tmpContext.FfmpegVersion = pVersion;
-						tmpContext.PackageVersion = this.PackageWriter.computePackageVersion(tmpContext.Plan, pVersion, tmpContext.SourceSha256);
-						tmpState.PackageVersion = tmpContext.PackageVersion;
-						tmpContext.Paths = this.EncodeRunner.packagePaths(tmpOutput, tmpContext.PackageVersion);
-						fProgress('plan', 100, `PackageVersion ${tmpContext.PackageVersion}`);
-						return fNext();
-					});
+				// Warnings never reach the PackageVersion (PackageWriter.planFingerprint drops them);
+				// step 2 has already logged them.
+				tmpContext.Preflight.Warnings.forEach((pWarning) => { tmpContext.Plan.Warnings.push(pWarning); });
+				tmpContext.FfmpegVersion = tmpContext.Preflight.Version;
+				tmpContext.PackageVersion = this.PackageWriter.computePackageVersion(tmpContext.Plan, tmpContext.FfmpegVersion, tmpContext.SourceSha256);
+				tmpState.PackageVersion = tmpContext.PackageVersion;
+				tmpContext.Paths = this.EncodeRunner.packagePaths(tmpOutput, tmpContext.PackageVersion);
+				fProgress('plan', 100, `PackageVersion ${tmpContext.PackageVersion}`);
+				return fNext();
 			},
-			// 4. Reuse a finished package of this version once it verifies; never
+			// 5. Reuse a finished package of this version once it verifies; never
 			//    replace an intact one (its bytes cannot be reproduced).  Then
 			//    claim <PV>.lock and create <PV>.partial/.
 			(fNext) =>
@@ -496,7 +656,7 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 				};
 				return fVerify();
 			},
-			// 5. The single-pass ladder encode.
+			// 6. The single-pass ladder encode.
 			(fNext) =>
 			{
 				fProgress('encode', 0, 'Encoding the ladder');
@@ -513,7 +673,7 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 						return fNext(pError);
 					});
 			},
-			// 6. Master reorder (540p first).
+			// 7. Master reorder (540p first).
 			(fNext) =>
 			{
 				try
@@ -526,13 +686,13 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 				}
 				return fNext();
 			},
-			// 7. Poster.
+			// 8. Poster.
 			(fNext) =>
 			{
 				fProgress('poster', 0, 'Rendering the poster');
 				tmpState.Current = this.PosterBuilder.build(tmpContext.Plan, tmpInput, libPath.join(tmpContext.Paths.PartialDirectory, libPosterBuilder.POSTER_FILE), (pError) => fNext(pError));
 			},
-			// 8. download.mp4.
+			// 9. download.mp4.
 			(fNext) =>
 			{
 				if (!tmpContext.Plan.Download)
@@ -543,8 +703,8 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 				let tmpTopMedia = libPath.join(tmpContext.Paths.PartialDirectory, tmpContext.Plan.Rungs[0].File);
 				tmpState.Current = this.DownloadBuilder.build(tmpTopMedia, libPath.join(tmpContext.Paths.PartialDirectory, libDownloadBuilder.DOWNLOAD_FILE), (pError) => fNext(pError));
 			},
-			// 9. Sanitise gate, over exactly the files that will be packaged: the
-			//    plan's list (a stray .DS_Store or Thumbs.db is never packaged).
+			// 10. Sanitise gate, over exactly the files that will be packaged: the
+			//     plan's list (a stray .DS_Store or Thumbs.db is never packaged).
 			(fNext) =>
 			{
 				fProgress('sanitise', 0, 'Checking outputs for metadata');
@@ -572,7 +732,7 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 						return fNext();
 					});
 			},
-			// 10. package.json.
+			// 11. package.json.
 			(fNext) =>
 			{
 				fProgress('package', 0, 'Writing package.json');
@@ -582,7 +742,7 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 						return fNext(pError);
 					});
 			},
-			// 11. Rename into place.
+			// 12. Rename into place.
 			(fNext) =>
 			{
 				try

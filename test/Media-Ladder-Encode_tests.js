@@ -36,6 +36,7 @@ const libPath = require('node:path');
 const libRetoldMediaLadder = require('../source/Retold-Media-Ladder.js');
 const libPackageWriter = require('../source/Package-Writer.js');
 const libTools = require('../source/Media-Ladder-Tools.js');
+const libStandInFFmpeg = require('./support/Stand-In-FFmpeg.js');
 
 const TOOLS_AVAILABLE = (() =>
 {
@@ -1001,18 +1002,20 @@ suite
 			'a cancelled encode never reports 100%: nothing reaches onProgress after the cancel, though ffmpeg flushes progress=end',
 			(fDone) =>
 			{
-				// A stand-in ffmpeg: answers -version, reports progress, and (as ffmpeg does) answers SIGTERM by
-				// flushing a final block marked progress=end before it exits.
+				// A stand-in ffmpeg: answers -version and the preflight's listings, reports progress, and (as ffmpeg
+				// does) answers SIGTERM by flushing a final block marked progress=end before it exits.
 				let tmpStub = libPath.join(tmpWorkDirectory, 'flushing-ffmpeg.js');
 				let tmpFlushed = libPath.join(tmpWorkDirectory, 'flushing-ffmpeg.flushed');
-				libFS.writeFileSync(tmpStub, [
-					`#!${process.execPath}`,
-					"if (process.argv.indexOf('-version') >= 0) { process.stdout.write('ffmpeg version stub-flush-for-tests\\n'); process.exit(0); }",
-					'let tmpUs = 0;',
-					"let tmpTimer = setInterval(() => { tmpUs += 100000; process.stdout.write('out_time_us=' + tmpUs + '\\nprogress=continue\\n'); }, 50);",
-					`process.on('SIGTERM', () => { clearInterval(tmpTimer); require('fs').writeFileSync(${JSON.stringify(tmpFlushed)}, 'end'); process.stdout.write('out_time_us=' + tmpUs + '\\nprogress=end\\n', () => process.exit(255)); });`,
-					''].join('\n'));
-				libFS.chmodSync(tmpStub, 0o755);
+				libStandInFFmpeg.writeStandInFFmpeg(tmpStub,
+					{
+						VersionLine: 'ffmpeg version stub-flush-for-tests',
+						Body:
+						[
+							'let tmpUs = 0;',
+							"let tmpTimer = setInterval(() => { tmpUs += 100000; process.stdout.write('out_time_us=' + tmpUs + '\\nprogress=continue\\n'); }, 50);",
+							`process.on('SIGTERM', () => { clearInterval(tmpTimer); require('fs').writeFileSync(${JSON.stringify(tmpFlushed)}, 'end'); process.stdout.write('out_time_us=' + tmpUs + '\\nprogress=end\\n', () => process.exit(255)); });`
+						]
+					});
 				let tmpOutput = libPath.join(tmpWorkDirectory, 'cancel-flush');
 				let tmpState = { Cancelled: false, Before: [], After: [] };
 				let tmpHandle = new libRetoldMediaLadder({ FFmpegPath: tmpStub }).encode(tmpSources.NoAudio,
@@ -1309,17 +1312,20 @@ suite
 			function (fDone)
 			{
 				this.timeout(20000);
-				// A stand-in ffmpeg: answers -version, then "encodes" forever and ignores SIGTERM / SIGINT.
+				// A stand-in ffmpeg: answers -version and the preflight's listings, then "encodes" forever and
+				// ignores SIGTERM / SIGINT.
 				let tmpStub = libPath.join(tmpWorkDirectory, 'stubborn-cli-ffmpeg.js');
 				let tmpPidFile = libPath.join(tmpWorkDirectory, 'stubborn-cli-ffmpeg.pid');
-				libFS.writeFileSync(tmpStub, [
-					`#!${process.execPath}`,
-					"if (process.argv.indexOf('-version') >= 0) { process.stdout.write('ffmpeg version stub-for-tests\\n'); process.exit(0); }",
-					`require('fs').writeFileSync(${JSON.stringify(tmpPidFile)}, String(process.pid));`,
-					"process.on('SIGTERM', () => {}); process.on('SIGINT', () => {});",
-					"let tmpUs = 0; setInterval(() => { tmpUs += 100000; process.stdout.write('out_time_us=' + tmpUs + '\\nprogress=continue\\n'); }, 50);",
-					''].join('\n'));
-				libFS.chmodSync(tmpStub, 0o755);
+				libStandInFFmpeg.writeStandInFFmpeg(tmpStub,
+					{
+						VersionLine: 'ffmpeg version stub-for-tests',
+						Body:
+						[
+							`require('fs').writeFileSync(${JSON.stringify(tmpPidFile)}, String(process.pid));`,
+							"process.on('SIGTERM', () => {}); process.on('SIGINT', () => {});",
+							"let tmpUs = 0; setInterval(() => { tmpUs += 100000; process.stdout.write('out_time_us=' + tmpUs + '\\nprogress=continue\\n'); }, 50);"
+						]
+					});
 				let tmpOutput = libPath.join(tmpWorkDirectory, 'cli-interrupt');
 				let tmpBin = libPath.join(__dirname, '..', 'bin', 'media-ladder.js');
 				let tmpChild = libChildProcess.spawn(process.execPath, [tmpBin, 'encode', tmpSources.NoAudio, '--out', tmpOutput, '--no-hwaccel'],

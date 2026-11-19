@@ -61,6 +61,15 @@ const POSTER_POSITION = 0.1;
 const DEFAULT_HWACCEL = 'videotoolbox';
 // h264_videotoolbox is VideoToolbox's encoder: macOS only.
 const FAST_ENCODER_PLATFORMS = ['darwin'];
+// A Windows command-line argument holding any of these is double-quoted: the
+// argv separators (space, tab, the line breaks), the quote itself, and the
+// characters cmd.exe acts on outside a quoted run (CMD_METACHARACTERS).
+const WIN32_QUOTE_PATTERN = /[ \t\r\n\v"&|<>^()]/;
+const CMD_METACHARACTERS = '&|<>^()';
+// The program (argv[0]) on a cmd.exe line is left bare only when it keeps to
+// these: cmd ends a bare program name at , ; = as well as at a space or tab,
+// and can read a / there as a switch.
+const WIN32_BARE_PROGRAM_PATTERN = /^[A-Za-z0-9_.:\\-]+$/;
 
 const WARNING_POSSIBLY_DLOG = 'Source is 10-bit but tagged SDR (possibly D-Log); pass --lut <file.cube> to colour-correct it.';
 
@@ -127,7 +136,8 @@ function chooseFirstVariantIndex(pRungs)
  * Why `Fast` (h264_videotoolbox) cannot encode on a platform, or null when it
  * can.  The planner never looks at the host -- a plan is the same wherever it
  * is made -- so the ladder's entry points and the CLI ask this first, and
- * fail before any probing or hashing. Pure.
+ * fail before any probing or hashing.  The reason names both ways of asking
+ * (the CLI's --fast, the API's Fast: true), since both callers show it. Pure.
  *
  * @param {string} pPlatform - a process.platform value
  * @returns {string|null}
@@ -138,7 +148,7 @@ function fastUnavailableReason(pPlatform)
 	{
 		return null;
 	}
-	return '--fast uses h264_videotoolbox, which is only available on macOS.';
+	return 'Fast encoding (--fast / Fast: true) uses h264_videotoolbox, which is only available on macOS.';
 }
 
 /**
@@ -508,14 +518,120 @@ function buildEncodeArguments(pPlan, pInputPath)
 }
 
 /**
- * Render an argument list as a copy-pasteable shell line (for `plan` output).
+ * One argument as the Microsoft C runtime's argv parser (and
+ * CommandLineToArgvW, which ffmpeg.exe reads its arguments with) reads it
+ * back: bare when nothing in it splits an argument or is acted on by cmd.exe,
+ * else double-quoted, with each " written \" and each run of backslashes
+ * before a " (or before the closing quote) doubled.  Backslashes anywhere
+ * else are literal, so a Windows path stays as it is.  Not for the program
+ * name (argv[0]), which is read differently: see quoteWindowsProgram. Pure.
+ *
+ * @param {string} pValue
+ * @returns {string}
+ */
+function quoteWindowsArgument(pValue)
+{
+	let tmpValue = String(pValue);
+	if (tmpValue.length > 0 && !WIN32_QUOTE_PATTERN.test(tmpValue))
+	{
+		return tmpValue;
+	}
+	let tmpQuoted = '"';
+	let tmpBackslashes = 0;
+	for (let i = 0; i < tmpValue.length; i++)
+	{
+		let tmpCharacter = tmpValue[i];
+		if (tmpCharacter === '\\')
+		{
+			tmpBackslashes++;
+			continue;
+		}
+		if (tmpCharacter === '"')
+		{
+			tmpQuoted += '\\'.repeat((tmpBackslashes * 2) + 1) + '"';
+		}
+		else
+		{
+			tmpQuoted += '\\'.repeat(tmpBackslashes) + tmpCharacter;
+		}
+		tmpBackslashes = 0;
+	}
+	return tmpQuoted + '\\'.repeat(tmpBackslashes * 2) + '"';
+}
+
+/**
+ * The program (argv[0]) for a cmd.exe line: bare when it is only letters,
+ * digits and _ . : \ -, else double-quoted.  cmd.exe ends a bare program
+ * name at a space, a tab, , ; or = (and can read a / there as a switch), so
+ * a path like C:\ffmpeg,7.1\bin\ffmpeg.exe has to be quoted.  The C runtime
+ * reads a quoted argv[0] to the closing quote with no escapes, so the path
+ * goes between the quotes exactly as it is (a Windows path never holds a "). Pure.
+ *
+ * @param {string} pValue
+ * @returns {string}
+ */
+function quoteWindowsProgram(pValue)
+{
+	let tmpValue = String(pValue);
+	return WIN32_BARE_PROGRAM_PATTERN.test(tmpValue) ? tmpValue : `"${tmpValue}"`;
+}
+
+/**
+ * A command line made safe to type or paste into cmd.exe, which hands an
+ * external program its line untouched apart from its own syntax: it turns a
+ * quoted run on and off at every " (a backslash means nothing to it) and,
+ * outside one, acts on & | < > ^ ( ).  quoteWindowsArgument puts every
+ * argument holding one of those inside quotes, but an argument's own \"
+ * also flips cmd's state, so this walks the line as cmd will and puts a ^
+ * (which cmd removes) before each of them it would find outside a quoted
+ * run.  NOT escaped: cmd expands %NAME% (and, under delayed expansion,
+ * !NAME!) inside quotes and out, and has no escape for % that works in both;
+ * at the prompt an undefined name is left as typed, so `v%v/media.mp4` is
+ * safe there (a .bat or .cmd file expands it to nothing: each % has to be
+ * doubled in one).  A line break cannot be pasted at all. Pure.
+ *
+ * @param {string} pLine - the program (quoteWindowsProgram) and arguments (quoteWindowsArgument), joined by spaces
+ * @returns {string}
+ */
+function escapeForCmd(pLine)
+{
+	let tmpOutput = '';
+	let tmpQuoted = false;
+	for (let i = 0; i < pLine.length; i++)
+	{
+		let tmpCharacter = pLine[i];
+		if (tmpCharacter === '"')
+		{
+			tmpQuoted = !tmpQuoted;
+		}
+		else if (!tmpQuoted && CMD_METACHARACTERS.indexOf(tmpCharacter) >= 0)
+		{
+			tmpOutput += '^';
+		}
+		tmpOutput += tmpCharacter;
+	}
+	return tmpOutput;
+}
+
+/**
+ * Render an argument list as a copy-pasteable shell line (for `plan` output):
+ * POSIX shell quoting by default, or, for pPlatform 'win32', a line for
+ * cmd.exe that ffmpeg.exe receives intact (quoteWindowsProgram for the
+ * program, quoteWindowsArgument for each argument, then escapeForCmd;
+ * %NAME% is not escaped).  PowerShell parses a line
+ * differently and is not catered for.
  *
  * @param {string} pCommand
  * @param {Array<string>} pArguments
+ * @param {string} [pPlatform] - a process.platform value; 'win32' quotes for cmd.exe, anything else for a POSIX shell
  * @returns {string}
  */
-function formatCommandLine(pCommand, pArguments)
+function formatCommandLine(pCommand, pArguments, pPlatform)
 {
+	if (pPlatform === 'win32')
+	{
+		return escapeForCmd([quoteWindowsProgram(pCommand)].concat(pArguments.map(quoteWindowsArgument)).join(' '));
+	}
 	let fQuote = (pValue) =>
 	{
 		let tmpValue = String(pValue);
@@ -573,5 +689,6 @@ module.exports.fastUnavailableReason = fastUnavailableReason;
 module.exports.RUNG_TABLE = RUNG_TABLE;
 module.exports.HQ_1080 = HQ_1080;
 module.exports.X264_PRESETS = X264_PRESETS;
+module.exports.PROFILES = PROFILES;
 module.exports.WARNING_POSSIBLY_DLOG = WARNING_POSSIBLY_DLOG;
 module.exports.PLAN_VERSION = PLAN_VERSION;

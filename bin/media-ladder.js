@@ -7,9 +7,10 @@
 *   media-ladder encode <in> --out <dir> [flags] [--force]
 *   media-ladder push   <packageDir> [push flags]
 *
-* Flags: --preset <x264 preset>  --fast (macOS only)  --profile hq  --slowmo
-*        --lut <file.cube>  --no-download  --no-hwaccel  --segment-seconds <n>
-*        --json  --verbose  (-h / --help prints the usage, -V / --version the version)
+* Flags: --preset <x264 preset>  --fast (macOS only)  --profile standard|hq
+*        --slowmo  --lut <file.cube>  --no-download  --no-hwaccel
+*        --segment-seconds <1-60>  --json  --verbose  (-h / --help prints the
+*        usage, -V / --version the version)
 * Push:  --server <URL>  --token <T>  --prefix <path>  --source <original>
 *        --title <T>  --description <D>  --sensitivity normal|conversation
 *        --chunk-mib <n>  --retries <n>  --json  (env MEDIA_LADDER_SERVER /
@@ -17,8 +18,13 @@
 *
 * `encode` prints progress on stderr and the finished package directory on
 * stdout; `push` prints progress on stderr and "<AssetGUID> <PackageVersion>"
-* on stdout.  Exit codes: 0 success, 1 failure, 2 usage error, 130 cancelled
-* (an interrupt cancels cleanly; a second one stops at once).
+* on stdout; `plan` prints JSON, { Plan, Command }, where Command is the
+* ffmpeg command line quoted for this platform's shell (cmd.exe on Windows),
+* JSON-escaped: decode it (jq -r .Command) before pasting it.  Exit codes: 0
+* success, 1 failure, 2 usage error (an unknown flag, or a flag value that
+* can never be right, such as --segment-seconds 61; a file that is missing or
+* a server that refuses is a failure), 130 cancelled (an interrupt cancels
+* cleanly; a second one stops at once).
 *
 * @license MIT
 *
@@ -45,14 +51,15 @@ Usage:
 
 Flags:
   --out <dir>             where packages go: <dir>/<PackageVersion>/
-  --preset <name>         x264 preset (default medium; e.g. ultrafast, slow)
+  --preset <name>         x264 preset (default medium): ultrafast, superfast, veryfast,
+                          faster, fast, medium, slow, slower, veryslow or placebo
   --fast                  encode with h264_videotoolbox instead of x264 (macOS only)
-  --profile hq            raise the 1080p cap from 6000k to 7800k
+  --profile <name>        standard (default) or hq (caps 1080p at 7800k, not 6000k)
   --slowmo                stretch high-frame-rate footage to 30 fps (drops audio)
   --lut <file.cube>       apply a 3D LUT (DJI D-Log M -> Rec.709)
   --no-download           skip download.mp4
   --no-hwaccel            decode in software (no VideoToolbox)
-  --segment-seconds <n>   HLS segment length (default 6)
+  --segment-seconds <n>   HLS segment length in whole seconds, 1 to 60 (default 6)
   --force                 rebuild an existing package that fails verification
                           (an intact one is never replaced: delete it to re-encode)
   --json                  encode: print the package.json document instead of the path;
@@ -87,6 +94,22 @@ const BOOLEAN_FLAGS = ['--fast', '--slowmo', '--no-download', '--no-hwaccel', '-
 const PUSH_FLAGS = PUSH_VALUE_FLAGS.concat(['--json', '--verbose', '--help', '-h', '--version', '-V']);
 const MAX_CHUNK_MIB = 1024;
 const MIB = 1048576;
+// The planner's limits on --segment-seconds (SegmentSeconds), checked here first so a bad value is a usage error.
+const MIN_SEGMENT_SECONDS = 1;
+const MAX_SEGMENT_SECONDS = 60;
+// The most of a bad flag value a usage error echoes.
+const MAX_ECHOED_VALUE_CHARS = 100;
+
+/**
+ * A flag value for a usage error, made printable (it can hold anything).
+ *
+ * @param {string} pValue
+ * @returns {string}
+ */
+function echoValue(pValue)
+{
+	return libRetoldMediaLadder.Tools.printableText(pValue, MAX_ECHOED_VALUE_CHARS);
+}
 
 /**
  * Parse argv into { Command, Input, Flags }. Throws on bad usage.
@@ -129,8 +152,12 @@ function parseArguments(pArguments)
 }
 
 /**
- * Map CLI flags to ladder options. Throws on bad usage, including --fast
- * anywhere but macOS (h264_videotoolbox is VideoToolbox's encoder).
+ * Map CLI flags to ladder options. Throws on bad usage: a value that can
+ * never be right (an unknown --preset or --profile, a --segment-seconds that
+ * is not a whole number from 1 to 60), each naming its flag, and --fast
+ * anywhere but macOS (h264_videotoolbox is VideoToolbox's encoder).  Files
+ * (--lut, --out) are not looked at here: a missing one is a failure, not a
+ * usage error.
  *
  * @param {Object} pFlags
  * @param {string} [pPlatform] - default process.platform
@@ -141,6 +168,10 @@ function ladderOptions(pFlags, pPlatform)
 	let tmpOptions = {};
 	if (pFlags['--preset'])
 	{
+		if (libRetoldMediaLadder.LadderPlanner.X264_PRESETS.indexOf(pFlags['--preset']) < 0)
+		{
+			throw new Error(`--preset must be one of ${libRetoldMediaLadder.LadderPlanner.X264_PRESETS.join(', ')} (got ${echoValue(pFlags['--preset'])}).`);
+		}
 		tmpOptions.Preset = pFlags['--preset'];
 	}
 	if (pFlags['--fast'])
@@ -154,6 +185,10 @@ function ladderOptions(pFlags, pPlatform)
 	}
 	if (pFlags['--profile'])
 	{
+		if (libRetoldMediaLadder.LadderPlanner.PROFILES.indexOf(pFlags['--profile']) < 0)
+		{
+			throw new Error(`--profile must be one of ${libRetoldMediaLadder.LadderPlanner.PROFILES.join(', ')} (got ${echoValue(pFlags['--profile'])}).`);
+		}
 		tmpOptions.Profile = pFlags['--profile'];
 	}
 	if (pFlags['--slowmo'])
@@ -174,10 +209,11 @@ function ladderOptions(pFlags, pPlatform)
 	}
 	if (pFlags['--segment-seconds'])
 	{
+		// Digits, optionally with a zero fraction ("6.0", which 1.0.0 took, is a whole number too).
 		let tmpSeconds = Number(pFlags['--segment-seconds']);
-		if (!(tmpSeconds > 0))
+		if (!/^\d+(\.0+)?$/.test(pFlags['--segment-seconds']) || tmpSeconds < MIN_SEGMENT_SECONDS || tmpSeconds > MAX_SEGMENT_SECONDS)
 		{
-			throw new Error('--segment-seconds needs a positive number.');
+			throw new Error(`--segment-seconds must be a whole number from ${MIN_SEGMENT_SECONDS} to ${MAX_SEGMENT_SECONDS} (got ${echoValue(pFlags['--segment-seconds'])}).`);
 		}
 		tmpOptions.SegmentSeconds = tmpSeconds;
 	}
@@ -194,7 +230,10 @@ function ladderOptions(pFlags, pPlatform)
 
 /**
  * Map push flags (and the environment) to Publisher options. Throws on bad
- * usage; never puts the token in a message.
+ * usage, naming the flag (or the variable) a bad value came from; never puts
+ * the token, or a server URL (it may carry credentials), in a message.  A
+ * --source that is missing is a failure when the push reads it, not a usage
+ * error.
  *
  * @param {Object} pFlags
  * @param {Object} [pEnvironment] - default process.env
@@ -204,13 +243,25 @@ function pushOptions(pFlags, pEnvironment)
 {
 	let tmpEnvironment = pEnvironment || process.env;
 	let tmpOptions = {};
+	// The Publisher's own message, prefixed with where the value came from.
+	let fChecked = (pFrom, fCheck) =>
+	{
+		try
+		{
+			return fCheck();
+		}
+		catch (pError)
+		{
+			throw new Error(`${pFrom}: ${pError.message}`);
+		}
+	};
 
 	tmpOptions.Server = pFlags['--server'] || tmpEnvironment.MEDIA_LADDER_SERVER || '';
 	if (!tmpOptions.Server)
 	{
 		throw new Error('push needs --server <URL> (or MEDIA_LADDER_SERVER).');
 	}
-	libPublisher.parseServerURL(tmpOptions.Server);
+	fChecked(pFlags['--server'] ? '--server' : 'MEDIA_LADDER_SERVER', () => libPublisher.parseServerURL(tmpOptions.Server));
 
 	tmpOptions.Token = pFlags['--token'] || tmpEnvironment.MEDIA_LADDER_TOKEN || '';
 	if (!tmpOptions.Token)
@@ -219,10 +270,10 @@ function pushOptions(pFlags, pEnvironment)
 	}
 	if (!/^[\x21-\x7e]+$/.test(tmpOptions.Token))
 	{
-		throw new Error('The token contains characters that cannot be sent in a header.');
+		throw new Error(`${pFlags['--token'] ? '--token' : 'MEDIA_LADDER_TOKEN'}: The token contains characters that cannot be sent in a header.`);
 	}
 
-	tmpOptions.Prefix = libPublisher.normalizePrefix(pFlags['--prefix']);
+	tmpOptions.Prefix = fChecked('--prefix', () => libPublisher.normalizePrefix(pFlags['--prefix']));
 
 	if (pFlags['--source'])
 	{
@@ -342,7 +393,14 @@ function main(pArguments)
 	let tmpOptions;
 	try
 	{
-		tmpOptions = ladderOptions(tmpParsed.Flags);
+		// probe never encodes, so it ignores --fast (which only macOS can do) on every platform.
+		let tmpFlags = tmpParsed.Flags;
+		if (tmpParsed.Command === 'probe')
+		{
+			tmpFlags = Object.assign({}, tmpFlags);
+			delete tmpFlags['--fast'];
+		}
+		tmpOptions = ladderOptions(tmpFlags);
 	}
 	catch (pUsageError)
 	{
@@ -378,8 +436,11 @@ function main(pArguments)
 				{
 					return fail(pError);
 				}
+				// Plan.Warnings carries the ffmpeg preflight's findings too (a missing encoder, filter or hwaccel).
 				pResult.Plan.Warnings.forEach((pWarning) => { process.stderr.write(`warning: ${pWarning}\n`); });
-				return writeJSON({ Plan: pResult.Plan, Command: pResult.CommandLine });
+				// Command is quoted for this platform's shell (cmd.exe on Windows), but it goes out inside JSON, which
+				// escapes every " and \ in it: a reader decodes it (jq -r .Command) before pasting it there.
+				return writeJSON({ Plan: pResult.Plan, Command: libRetoldMediaLadder.LadderPlanner.formatCommandLine(tmpLadder.binaries.FFmpeg, pResult.Arguments, process.platform) });
 			});
 		return;
 	}

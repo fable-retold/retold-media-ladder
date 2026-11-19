@@ -3,7 +3,10 @@
 *
 * Driven entirely by ffprobe JSON fixtures in test/fixtures/ -- no ffmpeg runs.
 * Also the macOS-only `Fast` check at the ladder's entry points (the probe
-* stubbed with a fixture, the host platform overridden).
+* stubbed with a fixture, the host platform overridden), and the `plan`
+* command line: POSIX quoting kept byte-for-byte, and the Windows line read
+* back the way cmd.exe and then the Microsoft C runtime's argv parser read
+* it.
 *
 * @license MIT
 *
@@ -27,6 +30,168 @@ function argumentAfter(pArguments, pFlag)
 {
 	let tmpIndex = pArguments.indexOf(pFlag);
 	return (tmpIndex >= 0) ? pArguments[tmpIndex + 1] : undefined;
+}
+
+/**
+ * What cmd.exe hands an external program for a typed or pasted line: it
+ * turns a quoted run on and off at every " (a backslash means nothing to
+ * it); outside one, ^ escapes the next character (and is removed), and an
+ * unescaped & | < > ( ) would be acted on -- a redirect, a pipe, a second
+ * command -- so it fails the test.  % is left alone (the line never names
+ * a defined variable).
+ *
+ * @param {string} pLine
+ * @returns {string}
+ */
+function cmdPassThrough(pLine)
+{
+	let tmpOutput = '';
+	let tmpQuoted = false;
+	for (let i = 0; i < pLine.length; i++)
+	{
+		let tmpCharacter = pLine[i];
+		if (tmpCharacter === '"')
+		{
+			tmpQuoted = !tmpQuoted;
+		}
+		else if (!tmpQuoted && tmpCharacter === '^')
+		{
+			i++;
+			if (i >= pLine.length)
+			{
+				throw new Error('cmd.exe would read a trailing ^ as a line continuation.');
+			}
+			tmpOutput += pLine[i];
+			continue;
+		}
+		else if (!tmpQuoted && '&|<>()'.indexOf(tmpCharacter) >= 0)
+		{
+			throw new Error(`cmd.exe would act on the unquoted ${tmpCharacter} at ${i} in: ${pLine}`);
+		}
+		tmpOutput += tmpCharacter;
+	}
+	return tmpOutput;
+}
+
+/**
+ * The program cmd.exe looks for on a line: a quoted run at the start (the
+ * quotes removed), else everything up to the first space, tab, comma,
+ * semicolon or equals sign, which cmd ends a bare program name at.  A / in
+ * a bare program name fails the test: cmd can read it as a switch.
+ *
+ * @param {string} pLine
+ * @returns {string}
+ */
+function cmdProgramToken(pLine)
+{
+	if (pLine[0] === '"')
+	{
+		return pLine.slice(1, pLine.indexOf('"', 1));
+	}
+	let tmpProgram = /^[^ \t,;=]*/.exec(pLine)[0];
+	if (tmpProgram.indexOf('/') >= 0)
+	{
+		throw new Error(`cmd.exe may read the / in the bare program ${tmpProgram} as a switch.`);
+	}
+	return tmpProgram;
+}
+
+/**
+ * The Microsoft C runtime's argv parser (CommandLineToArgvW reads a line
+ * the same way, and ffmpeg.exe reads its arguments with that): argv[0] runs
+ * to the closing quote (or to whitespace) with no escapes; after it,
+ * arguments split on unquoted spaces and tabs, " turns a quoted run on and
+ * off, 2n backslashes before a " are n backslashes (the " still counts),
+ * 2n+1 are n and a literal ", and backslashes anywhere else are literal.  A
+ * doubled "" inside a quoted run is read differently by different runtimes,
+ * so a line that needs one fails the test.
+ *
+ * @param {string} pLine
+ * @returns {Array<string>}
+ */
+function parseWindowsCommandLine(pLine)
+{
+	let i = 0;
+	let tmpProgram = '';
+	if (pLine[0] === '"')
+	{
+		i = 1;
+		while (i < pLine.length && pLine[i] !== '"')
+		{
+			tmpProgram += pLine[i++];
+		}
+		i++;
+	}
+	else
+	{
+		while (i < pLine.length && pLine[i] !== ' ' && pLine[i] !== '\t')
+		{
+			tmpProgram += pLine[i++];
+		}
+	}
+	let tmpArguments = [tmpProgram];
+	let tmpCurrent = null;
+	let tmpQuoted = false;
+	while (i < pLine.length)
+	{
+		let tmpCharacter = pLine[i];
+		if ((tmpCharacter === ' ' || tmpCharacter === '\t') && !tmpQuoted)
+		{
+			if (tmpCurrent !== null)
+			{
+				tmpArguments.push(tmpCurrent);
+				tmpCurrent = null;
+			}
+			i++;
+			continue;
+		}
+		if (tmpCurrent === null)
+		{
+			tmpCurrent = '';
+		}
+		if (tmpCharacter === '\\')
+		{
+			let tmpBackslashes = 0;
+			while (pLine[i] === '\\')
+			{
+				tmpBackslashes++;
+				i++;
+			}
+			if (pLine[i] !== '"')
+			{
+				tmpCurrent += '\\'.repeat(tmpBackslashes);
+				continue;
+			}
+			tmpCurrent += '\\'.repeat(Math.floor(tmpBackslashes / 2));
+			if (tmpBackslashes % 2 === 1)
+			{
+				tmpCurrent += '"';
+				i++;
+			}
+			continue;
+		}
+		if (tmpCharacter === '"')
+		{
+			if (tmpQuoted && pLine[i + 1] === '"')
+			{
+				throw new Error(`The line needs a doubled "" inside a quoted run at ${i}: ${pLine}`);
+			}
+			tmpQuoted = !tmpQuoted;
+			i++;
+			continue;
+		}
+		tmpCurrent += tmpCharacter;
+		i++;
+	}
+	if (tmpQuoted)
+	{
+		throw new Error(`The line ends inside a quoted run: ${pLine}`);
+	}
+	if (tmpCurrent !== null)
+	{
+		tmpArguments.push(tmpCurrent);
+	}
+	return tmpArguments;
 }
 
 suite
@@ -381,6 +546,108 @@ suite
 
 		suite
 		(
+			'formatCommandLine: the plan command line, for a POSIX shell or for cmd.exe',
+			() =>
+			{
+				// Arguments each quoting rule has to get right: empty, spaces and tabs, quotes, backslashes before a
+				// quote and at the end, cmd's metacharacters (alone, and after an argument whose own \" flips cmd's
+				// quoted state), a UNC path, %, and the filter-graph characters.
+				const TRICKY_ARGUMENTS =
+				[
+					'', 'plain', 'two words', 'tab\there', 'quote"inside', 'trailing\\', 'trailing space\\', 'C:\\dir with space\\',
+					'back\\\\"slash', '\\\\server\\share\\in.mp4', 'a&b|c<d>e^f(g)', '"', '\\"', 'a"b', 'c&d (e)', '100%',
+					'x"&y"|z', '""', '\\\\', 'end\\\\ "', '[0:v]scale=-2:720,split=2[s0][s1];[s0]null[v0]', "it's", 'x$y'
+				];
+
+				test
+				(
+					'POSIX quoting is byte-for-byte 1.0.0\'s, and the default anywhere but Windows',
+					() =>
+					{
+						let tmpPlan = libLadderPlanner.planLadder(loadSummary('source-720p'), { Lut: "/footage/it's,[odd];.cube" });
+						let tmpArguments = libLadderPlanner.buildEncodeArguments(tmpPlan, '/footage/DJI 0001 (copy).MP4');
+						// What 1.0.0 printed for this plan.
+						let tmpExpected = String.raw`'/opt/ffmpeg 7/bin/ffmpeg' -hide_banner -nostdin -y -loglevel warning -hwaccel videotoolbox -i '/footage/DJI 0001 (copy).MP4' -filter_complex '[0:v]fps=30/1,scale=1280:720,setsar=1,lut3d=file=/footage/it\\\'\''s\,\[odd\]\;.cube:interp=tetrahedral,format=yuv420p,split=3[s0][s1][s2];[s0]null[v0];[s1]scale=-2:540[v1];[s2]scale=-2:360[v2]' -map '[v0]' -map '[v1]' -map '[v2]' -map 0:a:0 -map 0:a:0 -map 0:a:0 -map_metadata -1 -map_chapters -1 -fflags +bitexact -flags:v +bitexact -flags:a +bitexact -c:v libx264 -preset medium -profile:v high -crf 21 -sc_threshold 0 -g 60 -keyint_min 60 -force_key_frames 'expr:gte(t,n_forced*2)' -maxrate:v:0 3000k -bufsize:v:0 6000k -maxrate:v:1 2000k -bufsize:v:1 4000k -maxrate:v:2 730k -bufsize:v:2 1460k -color_primaries:v bt709 -color_trc:v bt709 -colorspace:v bt709 -color_range:v tv -c:a aac -b:a 128k -ac 2 -f hls -hls_time 6 -hls_playlist_type vod -hls_flags single_file+independent_segments -hls_segment_type fmp4 -hls_segment_filename v%v/media.mp4 -master_pl_name master.m3u8 -var_stream_map 'v:0,a:0 v:1,a:1 v:2,a:2' v%v/index.m3u8`;
+						[undefined, 'darwin', 'linux', 'freebsd'].forEach((pPlatform) =>
+							{
+								Expect(libLadderPlanner.formatCommandLine('/opt/ffmpeg 7/bin/ffmpeg', tmpArguments, pPlatform), String(pPlatform)).to.equal(tmpExpected);
+							});
+						Expect(libLadderPlanner.formatCommandLine('ffmpeg', ['', 'a b', "it's", 'x$y', '\\'])).to.equal(String.raw`ffmpeg '' 'a b' 'it'\''s' 'x$y' '\'`);
+					}
+				);
+
+				test
+				(
+					'win32: cmd.exe and then the C runtime\'s argv parser read every tricky argument back intact; plain ones stay bare',
+					() =>
+					{
+						let tmpLine = libLadderPlanner.formatCommandLine('ffmpeg', TRICKY_ARGUMENTS, 'win32');
+						Expect(parseWindowsCommandLine(cmdPassThrough(tmpLine))).to.deep.equal(['ffmpeg'].concat(TRICKY_ARGUMENTS));
+						// Each argument on its own, too (so cmd's quoted state starts afresh for each).
+						TRICKY_ARGUMENTS.forEach((pArgument) =>
+							{
+								let tmpOne = libLadderPlanner.formatCommandLine('ffmpeg', ['-i', pArgument, '-f', 'a&b'], 'win32');
+								Expect(parseWindowsCommandLine(cmdPassThrough(tmpOne)), tmpOne).to.deep.equal(['ffmpeg', '-i', pArgument, '-f', 'a&b']);
+							});
+						// Readable: nothing is quoted that does not need it; a Windows path keeps its backslashes.
+						Expect(libLadderPlanner.formatCommandLine('ffmpeg', ['-i', 'C:\\in.mp4', '-filter_complex', '[0:v]scale=-2:720[v0]', 'v%v/media.mp4', 'two words', '', 'expr:gte(t,n_forced*2)'], 'win32'))
+							.to.equal('ffmpeg -i C:\\in.mp4 -filter_complex [0:v]scale=-2:720[v0] v%v/media.mp4 "two words" "" "expr:gte(t,n_forced*2)"');
+						// A quote inside an argument flips cmd's state, so what follows it gets carets.
+						Expect(libLadderPlanner.formatCommandLine('ffmpeg', ['a"b', 'c&d'], 'win32')).to.equal('ffmpeg "a\\"b" "c^&d"');
+						Expect(libLadderPlanner.formatCommandLine('ffmpeg', ['C:\\dir with space\\'], 'win32')).to.equal('ffmpeg "C:\\dir with space\\\\"');
+					}
+				);
+
+				test
+				(
+					'win32: an ffmpeg path cmd.exe would cut short (a , ; or = in it, or a /) is quoted and goes between the quotes as it is; a plain one stays bare',
+					() =>
+					{
+						['C:\\ffmpeg,7.1\\bin\\ffmpeg.exe', 'C:\\ffmpeg;x\\ffmpeg.exe', 'C:\\build=full\\ffmpeg.exe', 'C:/ffmpeg/bin/ffmpeg.exe', 'C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe', 'C:\\tools (x86)\\ffmpeg.exe', 'C:\\a&b\\ffmpeg.exe'].forEach((pProgram) =>
+							{
+								let tmpLine = libLadderPlanner.formatCommandLine(pProgram, ['-i', 'in.mp4'], 'win32');
+								Expect(tmpLine, pProgram).to.equal(`"${pProgram}" -i in.mp4`);
+								Expect(cmdProgramToken(tmpLine), pProgram).to.equal(pProgram);
+								Expect(parseWindowsCommandLine(cmdPassThrough(tmpLine)), pProgram).to.deep.equal([pProgram, '-i', 'in.mp4']);
+							});
+						['ffmpeg', 'ffmpeg.exe', 'C:\\ffmpeg\\bin\\ffmpeg.exe', 'D:\\tools\\ffmpeg-7.1_full\\ffmpeg.exe'].forEach((pProgram) =>
+							{
+								let tmpLine = libLadderPlanner.formatCommandLine(pProgram, ['-i', 'in.mp4'], 'win32');
+								Expect(tmpLine, pProgram).to.equal(`${pProgram} -i in.mp4`);
+								Expect(cmdProgramToken(tmpLine), pProgram).to.equal(pProgram);
+								Expect(parseWindowsCommandLine(cmdPassThrough(tmpLine)), pProgram).to.deep.equal([pProgram, '-i', 'in.mp4']);
+							});
+						// The 1.0.0-style line, which left these bare, is what cmd.exe cuts short.
+						Expect(cmdProgramToken('C:\\ffmpeg,7.1\\bin\\ffmpeg.exe -i in.mp4')).to.equal('C:\\ffmpeg');
+					}
+				);
+
+				test
+				(
+					'win32: a whole ladder command -- a spaced ffmpeg.exe path, a LUT like C:\\x\\it\'s,[odd];.cube, an input with & and parentheses -- reaches ffmpeg.exe intact',
+					() =>
+					{
+						let tmpFFmpeg = 'C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe';
+						['source-720p', 'dji-4k-hlg-100fps-audio', 'drone-no-audio'].forEach((pFixture) =>
+							{
+								let tmpPlan = libLadderPlanner.planLadder(loadSummary(pFixture), { Lut: "C:\\x\\it's,[odd];.cube", Hwaccel: false });
+								let tmpArguments = libLadderPlanner.buildEncodeArguments(tmpPlan, 'C:\\footage\\DJI 0001 (copy) & more.MP4');
+								let tmpLine = libLadderPlanner.formatCommandLine(tmpFFmpeg, tmpArguments, 'win32');
+								Expect(parseWindowsCommandLine(cmdPassThrough(tmpLine)), pFixture).to.deep.equal([tmpFFmpeg].concat(tmpArguments));
+								Expect(tmpLine.indexOf(`"${tmpFFmpeg}" `), pFixture).to.equal(0);
+								// No argument holds a quote, so quoting alone keeps cmd off every metacharacter: no carets.
+								Expect(tmpLine, pFixture).to.not.contain('^');
+								Expect(tmpLine, pFixture).to.contain(' -force_key_frames "expr:gte(t,n_forced*2)" ');
+								// The graph needs no quotes for ffmpeg.exe: its escaped LUT path goes through as it is.
+								Expect(tmpLine, pFixture).to.contain(` -filter_complex ${libLadderPlanner.buildFilterGraph(tmpPlan)} `);
+							});
+					}
+				);
+			}
+		);
+
+		suite
+		(
 			'Fast is macOS-only',
 			() =>
 			{
@@ -405,7 +672,7 @@ suite
 						Expect(libLadderPlanner.fastUnavailableReason('darwin')).to.equal(null);
 						['linux', 'win32', 'freebsd'].forEach((pPlatform) =>
 							{
-								Expect(libLadderPlanner.fastUnavailableReason(pPlatform), pPlatform).to.equal('--fast uses h264_videotoolbox, which is only available on macOS.');
+								Expect(libLadderPlanner.fastUnavailableReason(pPlatform), pPlatform).to.equal('Fast encoding (--fast / Fast: true) uses h264_videotoolbox, which is only available on macOS.');
 							});
 						Expect(libLadderPlanner.planLadder(loadSummary('source-720p'), { Fast: true }).Video.Encoder).to.equal('h264_videotoolbox');
 					}
@@ -419,7 +686,7 @@ suite
 						let libRetoldMediaLadder = require('../source/Retold-Media-Ladder.js');
 						let fQuiet = () => {};
 						let tmpQuietLog = { trace: fQuiet, debug: fQuiet, info: fQuiet, warn: fQuiet, error: fQuiet };
-						let tmpReason = '--fast uses h264_videotoolbox, which is only available on macOS.';
+						let tmpReason = 'Fast encoding (--fast / Fast: true) uses h264_videotoolbox, which is only available on macOS.';
 						let tmpCalls = { Probe: 0, Hash: 0, Phases: [] };
 						let tmpOutput = libPath.join(require('node:os').tmpdir(), `retold-media-ladder-fast-${process.pid}-${Date.now()}`);
 						let tmpMissing = libPath.join(tmpOutput, 'no-such-source.mp4');
@@ -440,6 +707,12 @@ suite
 							{
 								tmpCalls.Probe++;
 								setImmediate(() => fCallback(null, loadSummary('source-720p')));
+								return libTools.inertHandle();
+							};
+							// No ffmpeg runs here: stand in for a capable one (the preflight has its own tests).
+							tmpLadder.preflight = (pPlan, pInputPath, fCallback) =>
+							{
+								setImmediate(() => fCallback(null, { FFmpeg: 'ffmpeg', Version: 'ffmpeg version 7.1', Major: 7, Runnable: true, Required: tmpLadder.ffmpegRequirements(pPlan, pInputPath), Missing: [], Message: null, Warnings: [] }));
 								return libTools.inertHandle();
 							};
 							return tmpLadder;

@@ -27,7 +27,17 @@ npm install retold-media-ladder
 The only npm dependency is `fable-serviceproviderbase`. It needs **ffmpeg and ffprobe 7.x** on `PATH` (or point
 `RETOLD_MEDIA_LADDER_FFMPEG` / `RETOLD_MEDIA_LADDER_FFPROBE`, or the `FFmpegPath` / `FFprobePath` options, at them),
 built with `libx264`, `zscale` (zimg) and `tonemap`; on macOS the default decode and `--fast` (which is macOS-only)
-use VideoToolbox. Homebrew's `ffmpeg` has all of it.
+use VideoToolbox. Homebrew's `ffmpeg` has all of it. On Windows, point the variables or options at the real
+`ffmpeg.exe` / `ffprobe.exe`, not a `.cmd` or `.bat` wrapper: since CVE-2024-27980, Node will not spawn one without a
+shell.
+
+Before it hashes the source, `encode` checks ffmpeg (the **preflight**): that it runs, and that `ffmpeg -encoders`,
+`-filters` and `-hwaccels` list every encoder, filter and hwaccel the encode, the poster and the download will use
+(listed once per process; muxers and ffprobe are not checked). A missing piece fails at once, with one message naming
+each of them (exit 1); `plan` shows the same findings as `warning:` lines and still prints the plan. An ffmpeg older
+than 7.x is a warning, not a refusal, and `encode` prints its warnings before the hash starts. Because the preflight
+comes before the hash that finds an existing package, re-running an encode to reuse a finished package also needs an
+ffmpeg that could build it.
 
 ## Command line
 
@@ -42,26 +52,35 @@ media-ladder --version
 | Flag | Meaning |
 |---|---|
 | `--out <dir>` | Packages land at `<dir>/<PackageVersion>/` (built in `<dir>/<PackageVersion>.partial/`, renamed when complete; `<dir>/<PackageVersion>.lock` keeps a second encode of the same package out while one runs). |
-| `--preset <name>` | x264 preset (default `medium`; `ultrafast` … `veryslow`). |
-| `--fast` | Encode with `h264_videotoolbox` instead of x264 (average 80% of each rung's cap). macOS only: anywhere else it is a usage error (exit 2). Not always faster -- see **Speed** below. |
-| `--profile hq` | Raise the 1080p cap from 6000k to 7800k. |
+| `--preset <name>` | x264 preset: `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium` (the default), `slow`, `slower`, `veryslow` or `placebo`. |
+| `--fast` | Encode with `h264_videotoolbox` instead of x264 (average 80% of each rung's cap). macOS only: anywhere else `plan` and `encode` refuse it as a usage error (exit 2); `probe` ignores it. Not always faster -- see **Speed** below. |
+| `--profile <name>` | `standard` (the default) or `hq`, which raises the 1080p cap from 6000k to 7800k. |
 | `--slowmo` | Stretch high-frame-rate footage to 30 fps (every frame shown; audio is dropped). |
 | `--lut <file.cube>` | Apply a 3D LUT (e.g. DJI's D-Log M → Rec.709 cube). D-Log has no tag, so it is never automatic. |
 | `--no-download` | Skip `download.mp4`. |
 | `--no-hwaccel` | Decode in software instead of VideoToolbox. |
-| `--segment-seconds <n>` | HLS segment length (default 6). |
+| `--segment-seconds <n>` | HLS segment length in whole seconds, 1-60 (default 6). |
 | `--force` | Rebuild an existing package that fails verification (a missing or changed file, an unreadable `package.json`). An **intact** package is never replaced -- see **Immutability** below. Without `--force`, an identical re-run verifies the finished package and reuses it, and a damaged one is an error. |
 | `--json` | `encode`: print `package.json` instead of the package path. |
 | `--verbose` | Log more. |
 | `-V`, `--version` | Print the version and exit (`0`). |
 
 `encode` prints progress on stderr and the finished package directory on stdout. Exit codes: `0` success, `1`
-failure (including a failed sanitise gate, or another encode of the same package already running), `2` usage error,
-`130` cancelled. The first Ctrl-C cancels whatever step is running -- hashing, the encode (ffmpeg gets SIGTERM, then
-SIGKILL after 5 s), the poster, the remux or the sanitise probes -- and removes the partial package; a second
-Ctrl-C SIGKILLs the step, removes the partial package and exits at once.
+failure (including an ffmpeg without an encoder, filter or hwaccel the encode needs, a missing source or LUT, a
+failed sanitise gate, or another encode of the same package already running), `2` usage error (an unknown flag, or a
+value no run could use, such as `--segment-seconds 61` or `--preset bogus`; the message names the flag), `130`
+cancelled. The first Ctrl-C cancels whatever step is running -- the preflight, hashing, the encode (ffmpeg gets
+SIGTERM, then SIGKILL after 5 s), the poster, the remux or the sanitise probes -- and removes the partial package; a
+second Ctrl-C SIGKILLs the step, removes the partial package and exits at once.
 
-`plan` prints the plan JSON and the exact ffmpeg command line without encoding anything.
+`plan` encodes nothing. It prints one JSON object on stdout, `{ "Plan": ..., "Command": "..." }`, whose `Command`
+string is the exact ffmpeg command line quoted for this platform's shell: POSIX quoting, or on Windows quoting for
+`cmd.exe` (not PowerShell). As a JSON string it has every `"` and `\` escaped (a Windows line always has some), so
+decode it before pasting it: `media-ladder plan in.mp4 | jq -r .Command`, or in PowerShell
+`(media-ladder plan in.mp4 | ConvertFrom-Json).Command`, then paste the line into `cmd.exe`. `cmd.exe` expands
+`%NAME%` even inside quotes and the line does not escape it. At the prompt, a name that is not a defined variable is
+left as typed, so the ladder's `v%v/...` paths come through; in a `.bat` or `.cmd` file cmd reads the text from one
+`%` to the next as a variable and the line comes out mangled, so double every `%` there.
 
 ### Pushing a package
 
@@ -165,7 +184,12 @@ no longer match their `PackageVersion`; the push protocol's `Files[]` hashes are
 
 A package is built in `<PV>.partial/` while `<PV>.lock` (pid, host, start time) is held. A second encode of the same
 package into the same directory fails fast (`InProgress`) instead of deleting the first one's work; a lock whose
-process is gone (a crash, a `kill -9`) is stale and is taken over, along with its partial directory.
+process is gone (a crash, a `kill -9`) is stale and is taken over, along with its partial directory. On Windows, where
+antivirus or the search indexer can hold a file for a moment, each rename into place retries `EPERM` / `EACCES` /
+`EBUSY` for up to 10 s (blocking, so a `--force` swap whose renames all stay locked can take about 30 s), and when
+`--force`'s swap still fails, the damaged package is moved back (if even that fails, it is left as
+`<PV>.retired-*`, with a warning, for you to delete). Removing a partial or replaced package lets Node retry a locked
+file for a few seconds. Elsewhere nothing is retried: a file that cannot be renamed or removed fails at once.
 
 Each rung playlist is `EXT-X-VERSION:7`, `EXT-X-PLAYLIST-TYPE:VOD`, `EXT-X-INDEPENDENT-SEGMENTS`, with
 `EXT-X-MAP:URI="media.mp4",BYTERANGE=…` and one `EXT-X-BYTERANGE` per segment -- one file per rung, no `.m4s`.
@@ -374,7 +398,7 @@ let tmpHandle = tmpLadder.encode('/footage/DJI_0001.MP4',
 	{
 		// pResult: { PackageVersion, PackageDirectory, Package, Plan, Warnings, Sanitise, Reused }
 	});
-// tmpHandle.cancel();  -> stops the running step (hash, ffmpeg SIGTERM then SIGKILL, poster, remux, probes);
+// tmpHandle.cancel();  -> stops the running step (preflight, hash, ffmpeg SIGTERM then SIGKILL, poster, remux, probes);
 //                         the callback gets an Error with .Cancelled = true
 // tmpHandle.abort();   -> SIGKILL now, remove the partial package, call back at once (also .Cancelled)
 ```
@@ -382,9 +406,11 @@ let tmpHandle = tmpLadder.encode('/footage/DJI_0001.MP4',
 | Method | Result |
 |---|---|
 | `probe(pInputPath, fCallback)` | `fCallback(pError, pSummary)` -- see `MediaProbe` below. |
-| `plan(pInputPath, pOptions, fCallback)` | `fCallback(pError, { Probe, Plan, Arguments, CommandLine })`, no encode. |
+| `plan(pInputPath, pOptions, fCallback)` | `fCallback(pError, { Probe, Plan, Arguments, CommandLine, Preflight })`, no encode. `CommandLine` is POSIX-quoted (`LadderPlanner.formatCommandLine(pCommand, Arguments, 'win32')` gives the `cmd.exe` form). It never fails over the ffmpeg build: the preflight's findings are appended to `Plan.Warnings` and reported in `Preflight` (below; an ffmpeg that does not run is `Runnable: false`, one that runs but cannot list its encoders, filters and hwaccels keeps its `Version`, and either way the reason is in `Message`). |
+| `preflight(pPlan, pInputPath, fCallback)` | The ffmpeg check `encode` runs before hashing: `fCallback(pError, { FFmpeg, Version, Major, Runnable, Required, Missing, Message, Warnings })`, `pError` only when ffmpeg cannot run or be listed, or the check was cancelled (`.Cancelled`), with the report so far. `Missing` is `[{ Kind, Name }]` (`Kind` `encoder`, `filter` or `hwaccel`), `Message` the capability error's text naming them (null when nothing is missing), `Warnings` the older-than-7.x warning. Returns `{ cancel(pImmediate) }`. |
+| `ffmpegRequirements(pPlan, pInputPath)` | `{ Encoders, Filters, Hwaccels }`: what the encode, the poster and (unless skipped) the download need, read from their argument lists. |
 | `push(pPackageDirectory, pOptions, fCallback)` | `Publisher.publish` (below): returns `{ cancel(), abort() }`. |
-| `encode(pInputPath, pOptions, fCallback)` | Returns `{ cancel(), abort() }`. Options: `OutputDirectory` (required), `Preset`, `Fast` (macOS only: refused elsewhere, before probing), `Profile` (`'standard'` / `'hq'`), `SlowMotion`, `Lut`, `Download` (default true), `Hwaccel` (default true on macOS), `SegmentSeconds`, `CRF`, `Force` (rebuild a damaged package; never an intact one), `onProgress({ Phase, Percent, Message })` (nothing is reported after `cancel()` or `abort()`). Phases: `probe`, `hash`, `plan`, `verify` (an existing package), `encode`, `poster`, `download`, `sanitise`, `package`, `done`. Errors may carry `.Cancelled`, `.InProgress` (another live encode holds `<PV>.lock`) or `.PackageExists` (`Force` on an intact package). |
+| `encode(pInputPath, pOptions, fCallback)` | Returns `{ cancel(), abort() }`. Options: `OutputDirectory` (required), `Preset`, `Fast` (macOS only: refused elsewhere, before probing), `Profile` (`'standard'` / `'hq'`), `SlowMotion`, `Lut`, `Download` (default true), `Hwaccel` (default true on macOS), `SegmentSeconds` (whole seconds, 1-60), `CRF`, `Force` (rebuild a damaged package; never an intact one), `onProgress({ Phase, Percent, Message })` (nothing is reported after `cancel()` or `abort()`). Phases: `probe`, `preflight`, `hash`, `plan`, `verify` (an existing package), `encode`, `poster`, `download`, `sanitise`, `package`, `done`. Errors may carry `.Cancelled`, `.InProgress` (another live encode holds `<PV>.lock`), `.PackageExists` (`Force` on an intact package) or `.Capability` (the ffmpeg lacks a piece the encode needs, with `.Missing`, `.FFmpeg` and `.FFmpegVersion`; raised before the source is hashed or anything is written). |
 
 The macOS-only parts (`Hwaccel` on by default, `Fast` allowed) follow a ladder's `platform` property, which is
 `process.platform` unless you set it.
@@ -399,13 +425,22 @@ with `.Cancelled = true`; `pImmediate` means SIGKILL rather than SIGTERM).
 | Service | Job | Pure helpers |
 |---|---|---|
 | `MediaProbe` | `probe(pPath, fCb)` / `probeRaw(pPath, fCb)`: full ffprobe JSON condensed to `{ DurationSeconds, HasVideo, HasAudio, AudioStreamCount, DataStreamCount, Video: { Width, Height, Rotation, DisplayWidth, DisplayHeight, FrameRate, FrameRateValue, PixelFormat, BitDepth, ColorTransfer, ColorPrimaries, ColorSpace, ColorRange, Transfer ('sdr'/'hlg'/'pq'), IsHDR }, Audio, Raw }`. | `summarize(pRaw)`, `normalizeRotation`, `streamRotation`, `streamBitDepth`, `classifyTransfer` |
-| `LadderPlanner` | `plan(pSummary, pOptions)` → the plan; `buildEncodeArguments(pPlan, pInput)`. | `planLadder`, `fastUnavailableReason(pPlatform)` (null on macOS, else why `Fast` is refused), `buildFilterGraph`, `buildPictureChain`, `buildVarStreamMap`, `buildEncodeArguments`, `toneMapChain`, `lutChain`, `evenScaledLongSide`, `chooseFirstVariantIndex`, `formatCommandLine` |
-| `EncodeRunner` | `run(pArgs, { Cwd, DurationSeconds, onProgress, KillTimeoutMS }, fCb)` → `{ cancel(pImmediate), Process }` (async spawn, `-progress pipe:1`); `packagePaths` (`{ PackageDirectory, PartialDirectory, LockFile }`), `claimLock`, `releaseLock`, `preparePartial` (claims the lock first), `commitPartial(pOut, pPV, pReplaceDamaged)`, `discardPartial` (releases the lock). | `parseProgressChunk`, `progressSeconds`, `progressPercent`, `readLockOwner`, `lockOwnerIsLive` |
+| `LadderPlanner` | `plan(pSummary, pOptions)` → the plan; `buildEncodeArguments(pPlan, pInput)`. | `planLadder`, `fastUnavailableReason(pPlatform)` (null on macOS, else why `Fast` is refused), `buildFilterGraph`, `buildPictureChain`, `buildVarStreamMap`, `buildEncodeArguments`, `toneMapChain`, `lutChain`, `evenScaledLongSide`, `chooseFirstVariantIndex`, `formatCommandLine(pCommand, pArguments, pPlatform)` (POSIX quoting; `'win32'` quotes for `cmd.exe`, the program path included), `X264_PRESETS`, `PROFILES` |
+| `EncodeRunner` | `run(pArgs, { Cwd, DurationSeconds, onProgress, KillTimeoutMS }, fCb)` → `{ cancel(pImmediate), Process }` (async spawn, `-progress pipe:1`); `packagePaths` (`{ PackageDirectory, PartialDirectory, LockFile }`), `claimLock`, `releaseLock`, `preparePartial` (claims the lock first), `commitPartial(pOut, pPV, pReplaceDamaged)` (moves a damaged package back if the swap fails), `discardPartial` (releases the lock), `renameWithRetry(pFrom, pTo)` (on win32, retries `EPERM` / `EACCES` / `EBUSY` on the `renameRetry` schedule), `removeDirectory(pPath)` (on win32, Node retries a locked file: `RM_RETRY`). The `platform`, `fileSystem` and `renameRetry` properties can be overridden (to simulate Windows anywhere). | `parseProgressChunk`, `progressSeconds`, `progressPercent`, `readLockOwner`, `lockOwnerIsLive`, `retryDelays(pFirstMS, pMaxMS, pTotalMS)`, `RETRYABLE_RENAME_CODES`, `RENAME_RETRY` (`{ FirstMS: 50, MaxMS: 1000, TotalMS: 10000 }`), `RM_RETRY` (`{ maxRetries: 3, retryDelay: 100 }`) |
 | `PosterBuilder` | `build(pPlan, pInput, pOutput, fCb)` | `buildPosterArguments` |
 | `DownloadBuilder` | `build(pTopMedia, pOutput, fCb)` | `buildDownloadArguments` |
 | `Sanitiser` | `checkFiles(pDirectory, pRelativePaths, fCb)` → `{ Passed, Violations: [{ File, Where, Key, Value, Reason }], Checked }` | `inspectProbe`, `inspectJpeg`, `inspectPlaylist`, `describeViolations` |
 | `Publisher` | `publish(pPackageDirectory, pOptions, fCb)` → `{ cancel(), abort() }`, the push client (see **Push protocol**). Options: `Server`, `Token` (required), `Prefix`, `Source` (an original's path to hash and probe, or a ready `{ Name, Sha256, Transfer, CaptureDate }`), `Title`, `Description`, `Sensitivity`, `ChunkBytes` (32 MiB), `MinChunkBytes` (8 MiB), `Retries` (5), `BackoffMS` (1000), `MaxBackoffMS` (30000), `SlowChunkMS` (120000), `SocketTimeoutMS` (120000), `CommitTimeoutMS` (1800000), `BusyWaitMS` (360000: how long a busy file -- a `PUT` `409` at the offset `HEAD` reports -- is waited for before the push gives up; `0` gives up at once), `onProgress({ Phase, Path?, Done, Total, Percent, Message })` with phases `verify`, `source`, `register`, `upload` (bytes), `commit`, `done`. Result `{ AssetGUID, PackageVersion, State, UploadedFiles, UploadedBytes, TotalBytes, Source }`. Errors may carry `.Cancelled`, `.Refused` (not a committed `<PV>/`), `.Damaged` + `.Problems`, `.StatusCode` + `.ServerError` (+ `.Errors`), `.Retryable` (gave up; a re-run resumes), `.Oversize` + `.ServerOffset` (the server still held more bytes of a file than it has after the commit should have emptied it), `.LivePackageVersion` (a commit `409` for a version that is not the asset's live one). Constructed with options, `Server` / `Token` / `Prefix` / the tuning keys become per-call defaults. Also `probeSource(pPath, fCb)` → `{ Name, Sha256, Transfer, CaptureDate? }`. | `parseServerURL`, `normalizePrefix`, `encodeUploadPath`, `backoffDelay`, `shrinkChunk`, `isRetryableStatus`, `checkPackageDirectoryName`, `captureDateFromProbe`, `sourceFromProbe`, `normalizeSourceBlock`, `commitRetryPaths`, `parseOffsetHeader`, `printableServerText` |
 | `PackageWriter` | `computePackageVersion(pPlan, pFfmpegVersion, pSourceSha256)`, `reorderMasterFile(pDir, pPlan)` (rebuilds a master missing variants), `measureRungs(pDir, pPlan)`, `verifyPackage(pDir, pPackageVersion, fCb)` → `{ Intact, Problems, Document }`, `hashFiles(pDir, pPaths, fCb)`, `selectPackageFiles(pDir, pPlan)` → the planned files present (a missing one throws, except `poster.jpg`; anything else in the directory is left out, with a warning), `write(pDir, { Plan, PackageVersion, Variants?, FilePaths? }, fCb)` (`FilePaths`: what `selectPackageFiles` returned; selected when absent) | `parseMasterPlaylist`, `reorderMaster`, `parseMediaPlaylist`, `parseByteRange`, `measureBandwidth`, `codecsFromInit`, `buildMasterPlaylist`, `planFingerprint`, `computePackageVersion`, `buildPackageDocument`, `plannedPackageFiles(pPlan)` (the allowlist: `master.m3u8`, each rung's playlist and media, `poster.jpg`, `download.mp4` unless skipped), `listPackageFiles` (everything on disk, strays included) |
+
+`Tools` (also on the main module) holds the shared helpers, the preflight's among them:
+`ffmpegCapabilities(pFFmpeg, { Refresh }, fCb)` → `{ Encoders, Filters, Hwaccels }` (the three listings, run side by
+side and kept per ffmpeg path for the life of the process), `checkFFmpegCapabilities(pFFmpeg, pRequired, fCb)` →
+`Missing` (a kept listing that comes up short is listed again first), `clearFFmpegCapabilityCache(pFFmpeg?)`, and the
+pure `capabilityRequirements(pArgumentLists)`, `missingCapabilities`, `describeMissingCapabilities`, `capabilityError`,
+`olderFFmpegWarning`, `parseFFmpegMajorVersion`, `ffmpegVersionText`, `parseEncoderList`, `parseFilterList`,
+`parseHwaccelList`, `filterGraphNames`, `printableText`, `TESTED_FFMPEG_MAJOR`, `FFMPEG_REQUIREMENT`, `FFMPEG_FAST_HINT` and
+`FFMPEG_HWACCEL_HINT`.
 
 ## Tests
 
@@ -422,7 +457,10 @@ on-disk contract: every file in `package.json` exists with matching `Bytes` / `S
 ffprobe of every output passes the sanitise gate, a portrait top rung is short-side wide, and tone-mapped output is
 8-bit BT.709. Lifecycle tests cover reuse after verification, `--force` refusing an intact package and rebuilding a
 damaged one, two concurrent encodes of one package, and cancel / abort in each phase (including the CLI's second
-Ctrl-C). It skips loudly when ffmpeg is not installed.
+Ctrl-C). It skips loudly when ffmpeg is not installed. Stand-in ffmpeg and ffprobe scripts cover the preflight (a
+build missing pieces, an older one, a hung or failed listing), the CLI's usage errors and `plan`'s output, and the
+planner tests read the Windows form of the command line back through models of `cmd.exe` and the C runtime's argv
+parser; the Windows commit retries are simulated on any OS.
 
 The push tests run `Publisher` and `media-ladder push` against an in-test fake server
 ([`test/support/Fake-Media-Ingest-Server.js`](https://github.com/fable-retold/retold-media-ladder/blob/main/test/support/Fake-Media-Ingest-Server.js),

@@ -14,6 +14,14 @@
 * deleting the first one's work, and a lock left by a dead process is taken
 * over.  A finished `<PV>/` is never replaced unless it was verified damaged.
 *
+* On Windows, antivirus and the search indexer briefly lock files that were
+* just written, and renaming their directory then fails with EPERM, EACCES
+* or EBUSY; the commit's renames retry those for up to about 10 s (doubling
+* waits from 50 ms) before giving up.  Directory removals ask Node to retry
+* the same transient errors on every platform.  The host platform and the
+* file system calls are instance properties (`platform`, `fileSystem`,
+* `renameRetry`), so both sides can be tested on one machine.
+*
 * @license MIT
 *
 * @author Steven Velozo <steven@velozo.com>
@@ -34,6 +42,22 @@ const PARTIAL_SUFFIX = '.partial';
 const LOCK_SUFFIX = '.lock';
 const UNREADABLE_LOCK_GRACE_MS = 30000;
 const PACKAGE_VERSION_PATTERN = /^[0-9a-f]{8}$/;
+// What a Windows rename fails with while another process (antivirus, the
+// indexer) briefly holds a file inside the directory: worth waiting out.
+const RETRYABLE_RENAME_CODES = ['EPERM', 'EACCES', 'EBUSY'];
+// The commit's rename retries on win32: FirstMS doubling, each wait at most
+// MaxMS, for TotalMS in all.
+const RENAME_RETRY = { FirstMS: 50, MaxMS: 1000, TotalMS: 10000 };
+// On win32 a directory removal asks Node to retry a briefly locked file
+// itself (EBUSY / EMFILE / ENFILE / ENOTEMPTY / EPERM), waiting retryDelay,
+// then twice that, then three times.  Node runs that series again at each
+// directory level on EPERM, so a file that stays locked in
+// <PV>.partial/v0/ holds the removal about 2.5 s (Node 22); these removals
+// are on failure paths and a commit's clean-up, where that is the most worth
+// waiting.  Elsewhere a file that cannot be removed fails at once, as in 1.0.0.
+const RM_RETRY = { maxRetries: 3, retryDelay: 100 };
+const RM_DIRECTORY_OPTIONS = Object.freeze({ recursive: true, force: true });
+const RM_DIRECTORY_OPTIONS_WIN32 = Object.freeze(Object.assign({ recursive: true, force: true }, RM_RETRY));
 
 /**
  * Parse a chunk of `-progress` key=value output, carrying a partial line.
@@ -170,6 +194,52 @@ function lockOwnerIsLive(pOwner)
 	}
 }
 
+/**
+ * The waits between attempts of a retried rename: pFirstMS, doubling, each
+ * at most pMaxMS, until they add up to pTotalMS (the last is cut to fit).
+ * The defaults (50 / 1000 / 10000) give 50, 100, 200, 400, 800, then 1000
+ * eight times and 450: fifteen attempts over 10 s. Pure.
+ *
+ * @param {number} pFirstMS
+ * @param {number} pMaxMS
+ * @param {number} pTotalMS
+ * @returns {Array<number>} milliseconds
+ */
+function retryDelays(pFirstMS, pMaxMS, pTotalMS)
+{
+	let tmpDelays = [];
+	let tmpTotal = 0;
+	let tmpDelay = Number(pFirstMS);
+	let tmpMax = Number(pMaxMS);
+	let tmpBudget = Number(pTotalMS);
+	if (!(tmpDelay > 0) || !(tmpMax > 0) || !(tmpBudget > 0))
+	{
+		return tmpDelays;
+	}
+	while (tmpTotal < tmpBudget)
+	{
+		let tmpWait = Math.min(tmpDelay, tmpMax, tmpBudget - tmpTotal);
+		tmpDelays.push(tmpWait);
+		tmpTotal += tmpWait;
+		tmpDelay = Math.min(tmpDelay * 2, tmpMax);
+	}
+	return tmpDelays;
+}
+
+/**
+ * Block the thread for pMilliseconds.  Only for the rare Windows rename
+ * retry, which keeps commitPartial synchronous.
+ *
+ * @param {number} pMilliseconds
+ */
+function sleepSync(pMilliseconds)
+{
+	if (pMilliseconds > 0)
+	{
+		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, pMilliseconds);
+	}
+}
+
 class EncodeRunner extends libFableServiceProviderBase
 {
 	constructor(pFable, pOptions, pServiceHash)
@@ -185,6 +255,59 @@ class EncodeRunner extends libFableServiceProviderBase
 		this.binaries = libTools.resolveBinaries(this.options);
 		// Lock file -> the token this instance wrote into it.
 		this._lockTokens = {};
+		// The host OS (locked renames and removals are retried on win32 only), the
+		// file system calls the package lifecycle makes, and the rename retry
+		// schedule.  Overridable, so Windows' transient locks can be simulated
+		// on any machine.
+		this.platform = process.platform;
+		this.fileSystem = libFS;
+		this.renameRetry = Object.assign({}, RENAME_RETRY);
+	}
+
+	/**
+	 * renameSync, retried on win32 while another process briefly holds a
+	 * file inside (EPERM, EACCES, EBUSY), on the renameRetry schedule; the
+	 * last error is thrown when the time is up.  Any other error, and every
+	 * error elsewhere, is thrown at once.
+	 *
+	 * @param {string} pFrom
+	 * @param {string} pTo
+	 */
+	renameWithRetry(pFrom, pTo)
+	{
+		let tmpDelays = (this.platform === 'win32') ? retryDelays(this.renameRetry.FirstMS, this.renameRetry.MaxMS, this.renameRetry.TotalMS) : [];
+		for (let tmpAttempt = 0; ; tmpAttempt++)
+		{
+			try
+			{
+				this.fileSystem.renameSync(pFrom, pTo);
+				return;
+			}
+			catch (pError)
+			{
+				if (tmpAttempt >= tmpDelays.length || RETRYABLE_RENAME_CODES.indexOf(pError && pError.code) < 0)
+				{
+					throw pError;
+				}
+				if (tmpAttempt === 0)
+				{
+					this.log.warn(`EncodeRunner: renaming ${pFrom} to ${pTo} failed (${pError.code}: another program, such as antivirus or the search indexer, may be holding a file in it); retrying for up to ${(this.renameRetry.TotalMS >= 1000) ? `${libTools.roundTo(this.renameRetry.TotalMS / 1000, 1)} s` : `${this.renameRetry.TotalMS} ms`}.`);
+				}
+				sleepSync(tmpDelays[tmpAttempt]);
+			}
+		}
+	}
+
+	/**
+	 * Remove a directory tree (recursive, force).  On win32 Node retries a
+	 * briefly locked file inside (RM_RETRY); elsewhere a failure is thrown at
+	 * once.
+	 *
+	 * @param {string} pPath
+	 */
+	removeDirectory(pPath)
+	{
+		this.fileSystem.rmSync(pPath, (this.platform === 'win32') ? RM_DIRECTORY_OPTIONS_WIN32 : RM_DIRECTORY_OPTIONS);
 	}
 
 	/**
@@ -203,7 +326,10 @@ class EncodeRunner extends libFableServiceProviderBase
 	{
 		let tmpRunOptions = pRunOptions || {};
 		let tmpKillTimeout = (typeof tmpRunOptions.KillTimeoutMS === 'number') ? tmpRunOptions.KillTimeoutMS : DEFAULT_KILL_TIMEOUT_MS;
-		let tmpArguments = ['-progress', 'pipe:1', '-nostats', '-stats_period', '0.5'].concat(pArguments);
+		// ffmpeg writes a -progress block every 0.5 s by default (-stats_period's
+		// default since 4.4, a fixed 0.5 s before it), so no -stats_period: it
+		// would only make a pre-4.4 ffmpeg refuse the encode.
+		let tmpArguments = ['-progress', 'pipe:1', '-nostats'].concat(pArguments);
 
 		let tmpState = { Finished: false, Cancelled: false, KillTimer: null, Carry: '', Block: {}, Stderr: '' };
 
@@ -330,13 +456,13 @@ class EncodeRunner extends libFableServiceProviderBase
 	claimLock(pOutputDirectory, pPackageVersion)
 	{
 		let tmpPaths = this.packagePaths(pOutputDirectory, pPackageVersion);
-		libFS.mkdirSync(libPath.dirname(tmpPaths.LockFile), { recursive: true });
+		this.fileSystem.mkdirSync(libPath.dirname(tmpPaths.LockFile), { recursive: true });
 		let tmpOwner = { Pid: process.pid, Hostname: libOS.hostname(), Started: new Date().toISOString(), Token: libCrypto.randomBytes(8).toString('hex') };
 		for (let tmpAttempt = 0; tmpAttempt < 2; tmpAttempt++)
 		{
 			try
 			{
-				libFS.writeFileSync(tmpPaths.LockFile, JSON.stringify(tmpOwner), { flag: 'wx' });
+				this.fileSystem.writeFileSync(tmpPaths.LockFile, JSON.stringify(tmpOwner), { flag: 'wx' });
 				this._lockTokens[tmpPaths.LockFile] = tmpOwner.Token;
 				return tmpPaths.LockFile;
 			}
@@ -357,7 +483,7 @@ class EncodeRunner extends libFableServiceProviderBase
 			}
 			// Stale: the owner is gone. Take it over.
 			this.log.warn(`EncodeRunner: removing a stale lock ${tmpPaths.LockFile} (owner ${(tmpHolder && tmpHolder.Pid) || 'unknown'} is gone).`);
-			libFS.rmSync(tmpPaths.LockFile, { force: true });
+			this.fileSystem.rmSync(tmpPaths.LockFile, { force: true });
 		}
 		let tmpRace = new Error(`Package ${pPackageVersion} is already being encoded into ${libPath.dirname(tmpPaths.LockFile)} (the lock was re-taken while clearing a stale one).`);
 		tmpRace.InProgress = true;
@@ -385,7 +511,7 @@ class EncodeRunner extends libFableServiceProviderBase
 		{
 			return false;
 		}
-		libFS.rmSync(tmpPaths.LockFile, { force: true });
+		this.fileSystem.rmSync(tmpPaths.LockFile, { force: true });
 		return true;
 	}
 
@@ -404,8 +530,8 @@ class EncodeRunner extends libFableServiceProviderBase
 		this.claimLock(pOutputDirectory, pPackageVersion);
 		try
 		{
-			libFS.rmSync(tmpPaths.PartialDirectory, { recursive: true, force: true });
-			libFS.mkdirSync(tmpPaths.PartialDirectory);
+			this.removeDirectory(tmpPaths.PartialDirectory);
+			this.fileSystem.mkdirSync(tmpPaths.PartialDirectory);
 		}
 		catch (pError)
 		{
@@ -424,6 +550,12 @@ class EncodeRunner extends libFableServiceProviderBase
 	 * `<PV>/` is only replaced when the caller has verified it is DAMAGED
 	 * (pReplaceDamaged); it is moved aside first and removed after the swap.
 	 *
+	 * Both renames retry Windows' transient locks (renameWithRetry).  When
+	 * the new package cannot be renamed into place after all, the damaged one
+	 * is moved back to `<PV>/` (best effort) and the error is thrown, so the
+	 * caller is left with what it had.  Once the new package is in place,
+	 * failing to remove the damaged one only warns.
+	 *
 	 * @param {string} pOutputDirectory
 	 * @param {string} pPackageVersion
 	 * @param {boolean} pReplaceDamaged
@@ -433,16 +565,34 @@ class EncodeRunner extends libFableServiceProviderBase
 	{
 		let tmpPaths = this.packagePaths(pOutputDirectory, pPackageVersion);
 		let tmpRetired = false;
-		if (libFS.existsSync(tmpPaths.PackageDirectory))
+		if (this.fileSystem.existsSync(tmpPaths.PackageDirectory))
 		{
 			if (!pReplaceDamaged)
 			{
 				throw new Error(`Package ${tmpPaths.PackageDirectory} already exists; a finished package is never replaced.`);
 			}
 			tmpRetired = `${tmpPaths.PackageDirectory}.retired-${process.pid}-${Date.now()}`;
-			libFS.renameSync(tmpPaths.PackageDirectory, tmpRetired);
+			this.renameWithRetry(tmpPaths.PackageDirectory, tmpRetired);
 		}
-		libFS.renameSync(tmpPaths.PartialDirectory, tmpPaths.PackageDirectory);
+		try
+		{
+			this.renameWithRetry(tmpPaths.PartialDirectory, tmpPaths.PackageDirectory);
+		}
+		catch (pCommitError)
+		{
+			if (tmpRetired)
+			{
+				try
+				{
+					this.renameWithRetry(tmpRetired, tmpPaths.PackageDirectory);
+				}
+				catch (pRestoreError)
+				{
+					this.log.warn(`EncodeRunner: could not move the damaged package ${tmpRetired} back to ${tmpPaths.PackageDirectory}: ${pRestoreError.message}`);
+				}
+			}
+			throw pCommitError;
+		}
 		try
 		{
 			this.releaseLock(pOutputDirectory, pPackageVersion);
@@ -454,7 +604,15 @@ class EncodeRunner extends libFableServiceProviderBase
 		}
 		if (tmpRetired)
 		{
-			libFS.rmSync(tmpRetired, { recursive: true, force: true });
+			try
+			{
+				this.removeDirectory(tmpRetired);
+			}
+			catch (pRemoveError)
+			{
+				// The new package is in place: what is left of the damaged one is only clutter.
+				this.log.warn(`EncodeRunner: the package is in place, but the damaged package it replaced could not be removed (${tmpRetired}): ${pRemoveError.message}`);
+			}
 		}
 		return tmpPaths.PackageDirectory;
 	}
@@ -471,7 +629,7 @@ class EncodeRunner extends libFableServiceProviderBase
 		let tmpPaths = this.packagePaths(pOutputDirectory, pPackageVersion);
 		try
 		{
-			libFS.rmSync(tmpPaths.PartialDirectory, { recursive: true, force: true });
+			this.removeDirectory(tmpPaths.PartialDirectory);
 		}
 		finally
 		{
@@ -489,3 +647,7 @@ module.exports.lockOwnerIsLive = lockOwnerIsLive;
 module.exports.PARTIAL_SUFFIX = PARTIAL_SUFFIX;
 module.exports.LOCK_SUFFIX = LOCK_SUFFIX;
 module.exports.PACKAGE_VERSION_PATTERN = PACKAGE_VERSION_PATTERN;
+module.exports.retryDelays = retryDelays;
+module.exports.RETRYABLE_RENAME_CODES = RETRYABLE_RENAME_CODES;
+module.exports.RENAME_RETRY = RENAME_RETRY;
+module.exports.RM_RETRY = RM_RETRY;

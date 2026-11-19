@@ -2,6 +2,6 @@
 	"Name": "retold-media-ladder",
 	"Version": "1.0.0",
 	"Description": "Turn a video file into a private, adaptive-bitrate HLS package, and push it to a media-ingest server.",
-	"GeneratedAt": "2026-11-19T14:05:31.724Z",
-	"GitCommit": "967fdf9"
+	"GeneratedAt": "2026-11-19T16:21:56.139Z",
+	"GitCommit": "a85cc71"
 }
