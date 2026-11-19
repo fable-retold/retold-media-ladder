@@ -1,0 +1,68 @@
+{
+	"Generated": "2026-11-19T05:18:15.781Z",
+	"Mode": "module",
+	"GitHubOrg": "fable-retold",
+	"DefaultBranch": "master",
+	"Module": {
+		"Name": "retold-media-ladder",
+		"Repo": "retold-media-ladder",
+		"Group": "",
+		"Branch": "master",
+		"HasDocs": true,
+		"HasCover": true,
+		"Sidebar": [
+			{
+				"Title": "Getting Started",
+				"Children": [
+					{
+						"Title": "Overview",
+						"Path": "README.md"
+					},
+					{
+						"Title": "Pushing a package",
+						"Path": "push.md"
+					},
+					{
+						"Title": "Push protocol",
+						"Path": "push-protocol.md"
+					}
+				]
+			},
+			{
+				"Title": "Retold Ecosystem",
+				"Children": [
+					{
+						"Title": "Orator File Service",
+						"Path": "https://github.com/fable-retold/orator-file-service"
+					},
+					{
+						"Title": "Pict Section Fileview",
+						"Path": "https://github.com/fable-retold/pict-section-fileview"
+					},
+					{
+						"Title": "Pict Section Video",
+						"Path": "https://github.com/fable-retold/pict-section-video"
+					},
+					{
+						"Title": "Fable",
+						"Path": "https://fable-retold.github.io/fable/README.md"
+					}
+				]
+			}
+		],
+		"DocFiles": [
+			".nojekyll",
+			"README.md",
+			"_brand.json",
+			"_cover.md",
+			"_sidebar.md",
+			"_version.json",
+			"index.html",
+			"push-protocol.md",
+			"push.md",
+			"retold-catalog.json",
+			"retold-keyword-index.json"
+		]
+	},
+	"Groups": []
+}

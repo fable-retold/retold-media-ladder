@@ -8,13 +8,16 @@
 *   <out>/<PV>.partial/) -> master reorder -> poster -> download.mp4 ->
 *   sanitise gate -> package.json -> rename to <out>/<PV>/
 *
+* and pushes a finished package to a server (`push`, the Publisher service:
+* verify -> register -> resumable chunked upload -> commit).
+*
 * A finished package is immutable: it is never re-encoded in place, because a
 * re-encode with the same inputs (the same PackageVersion) does not reproduce
 * the same bytes.  `Force` only rebuilds a package that fails verification.
 *
 * Each step is its own fable-serviceproviderbase service (MediaProbe,
 * LadderPlanner, EncodeRunner, PosterBuilder, DownloadBuilder, Sanitiser,
-* PackageWriter); this service sequences them.  Every service also works
+* PackageWriter, Publisher); this service sequences them.  Every service also works
 * without a Fable (pass an options object), which is how the `media-ladder`
 * CLI runs.
 *
@@ -42,6 +45,7 @@ const libPosterBuilder = require('./Poster-Builder.js');
 const libDownloadBuilder = require('./Download-Builder.js');
 const libSanitiser = require('./Sanitiser.js');
 const libPackageWriter = require('./Package-Writer.js');
+const libPublisher = require('./Publisher.js');
 
 const _DefaultConfiguration =
 {
@@ -81,6 +85,7 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 		this.DownloadBuilder = this._createChild(libDownloadBuilder, tmpChildOptions);
 		this.Sanitiser = this._createChild(libSanitiser, tmpChildOptions);
 		this.PackageWriter = this._createChild(libPackageWriter, tmpChildOptions);
+		this.Publisher = this._createChild(libPublisher, tmpChildOptions);
 	}
 
 	_createChild(pClass, pOptions)
@@ -197,6 +202,20 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 				pOptions.LutSha256 = pDigest;
 				return fCallback(null);
 			});
+	}
+
+	/**
+	 * Push a finished package to a server (see Publisher.publish and the
+	 * README's "Push protocol").
+	 *
+	 * @param {string} pPackageDirectory - a committed <out>/<PackageVersion>/
+	 * @param {Object} pOptions - { Server, Token, Prefix?, Source?, Title?, Description?, Sensitivity?, ChunkBytes?, Retries?, onProgress? }
+	 * @param {function} fCallback - (pError, { AssetGUID, PackageVersion, State, UploadedFiles, UploadedBytes, TotalBytes, Source })
+	 * @returns {Object} handle { cancel(), abort() }
+	 */
+	push(pPackageDirectory, pOptions, fCallback)
+	{
+		return this.Publisher.publish(pPackageDirectory, pOptions, fCallback);
 	}
 
 	/**
@@ -579,4 +598,5 @@ module.exports.PosterBuilder = libPosterBuilder;
 module.exports.DownloadBuilder = libDownloadBuilder;
 module.exports.Sanitiser = libSanitiser;
 module.exports.PackageWriter = libPackageWriter;
+module.exports.Publisher = libPublisher;
 module.exports.Tools = libTools;

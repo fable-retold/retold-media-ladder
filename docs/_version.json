@@ -1,0 +1,7 @@
+{
+	"Name": "retold-media-ladder",
+	"Version": "1.0.0",
+	"Description": "Turn a video file into a private, adaptive-bitrate HLS package: probe, plan, one-pass ffmpeg encode (fMP4 single_file H.264 rungs, HLG/PQ tone-map, LUT, fps conform, portrait-aware), poster, faststart download, a metadata sanitise gate and a hashed package.json.",
+	"GeneratedAt": "2026-11-19T05:18:16.007Z",
+	"GitCommit": "5b0dabe"
+}

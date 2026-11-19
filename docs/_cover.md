@@ -7,6 +7,9 @@
 - **Colour handled** — HLG / PQ tone-mapped to BT.709 after the scale; `--lut` for D-Log M
 - **Private by construction** — GPS, capture dates, device tags and data tracks stripped, and a gate that fails the encode if any survive
 - **A hashed contract** — `package.json` with every file's bytes and sha256, versioned by plan + ffmpeg + source
+- **Resumable push** — `media-ladder push` registers, uploads raw chunks from the server's offset and commits; interrupted pushes pick up where they stopped
 
 [Overview](README.md)
+[Pushing a package](push.md)
+[Push protocol](push-protocol.md)
 [GitHub](https://github.com/fable-retold/retold-media-ladder)
