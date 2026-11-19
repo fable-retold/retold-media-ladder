@@ -4,14 +4,18 @@
 * Sources are made with ffmpeg lavfi (testsrc2 + sine) in a temp directory:
 * landscape with audio, native portrait, rotation-tagged portrait, no audio,
 * 10-bit HLG (libx265), 100 fps, a clip carrying location / creation_time /
-* Apple tags, and a 0.3 s clip (ffmpeg writes no master variants for it).
+* Apple tags, a 0.3 s clip (ffmpeg writes no master variants for it), and
+* 1 s of video in a 30 s container (the poster's seek point has no frame, so
+* the package has no poster and still pushes).
 * Every package goes through the on-disk contract check:
 * package.json files exist with matching Bytes/Sha256, the master starts on
 * the <=540 rung, every rung is a single_file fMP4 byte-range playlist with
 * EXT-X-MAP -> media.mp4 (no index.m4s anywhere), and ffprobe of every output
 * passes the sanitise gate.  The lifecycle tests cover package immutability
 * (--force never replaces an intact package), the `<PV>.lock` claim against a
-* concurrent encode, and cancel / abort in every phase.
+* concurrent encode, cancel / abort in every phase (a cancelled encode never
+* reports 100%), and stray OS files (.DS_Store, Thumbs.db) in the partial
+* package, which are never packaged, so the package still pushes.
 *
 * When ffmpeg/ffprobe are not on PATH the suite SKIPS LOUDLY.
 *
@@ -795,6 +799,165 @@ suite
 
 		test
 		(
+			'strays (.DS_Store, Thumbs.db) in <PV>.partial/ are never sanitised, listed, hashed or pushed; the package pushes',
+			(fDone) =>
+			{
+				let libFakeServer = require('./support/Fake-Media-Ingest-Server.js');
+				let tmpToken = 'test-token-0123456789abcdef';
+				let tmpWarnings = [];
+				let fQuiet = () => {};
+				let fRecord = (pMessage) => { tmpWarnings.push(String(pMessage)); };
+				let tmpStrayLadder = new libRetoldMediaLadder({ Log: { trace: fQuiet, debug: fQuiet, info: fQuiet, warn: fRecord, error: fRecord } });
+				// Record what the sanitise gate is asked to check.
+				let tmpSanitised = null;
+				let tmpRealCheckFiles = tmpStrayLadder.Sanitiser.checkFiles.bind(tmpStrayLadder.Sanitiser);
+				tmpStrayLadder.Sanitiser.checkFiles = (pDirectory, pRelativePaths, fCallback) =>
+				{
+					tmpSanitised = pRelativePaths.slice();
+					return tmpRealCheckFiles(pDirectory, pRelativePaths, fCallback);
+				};
+				let tmpStrayBytes = { '.DS_Store': Buffer.from([0, 0, 0, 1, 0x42, 0x75, 0x64, 0x31]), 'Thumbs.db': Buffer.from([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) };
+				let tmpStrays = ['.DS_Store', 'Thumbs.db', 'v0/.DS_Store', 'v0/Thumbs.db'];
+				let tmpOutput = libPath.join(tmpWorkDirectory, 'strays');
+				tmpStrayLadder.encode(tmpSources.NoAudio, Object.assign(
+					{
+						OutputDirectory: tmpOutput,
+						onProgress: (pEvent) =>
+						{
+							if (pEvent.Phase !== 'sanitise')
+							{
+								return;
+							}
+							// Finder / Explorer writing into <PV>.partial/ while someone looks in, just before the package is listed.
+							let tmpPartial = libFS.readdirSync(tmpOutput).filter((pName) => /\.partial$/.test(pName))[0];
+							tmpStrays.forEach((pPath) => { libFS.writeFileSync(libPath.join(tmpOutput, tmpPartial, pPath), tmpStrayBytes[libPath.basename(pPath)]); });
+						}
+					}, FAST), (pError, pResult) =>
+					{
+						if (pError)
+						{
+							return fDone(pError);
+						}
+						let tmpPlanned;
+						try
+						{
+							tmpPlanned = libPackageWriter.plannedPackageFiles(pResult.Plan);
+							Expect(tmpPlanned).to.include('poster.jpg').and.to.include('download.mp4');
+							let tmpDocument = JSON.parse(libFS.readFileSync(libPath.join(pResult.PackageDirectory, 'package.json'), 'utf8'));
+							Expect(tmpDocument.Files.map((pFile) => pFile.Path)).to.deep.equal(tmpPlanned);
+							// The gate checked exactly what was packaged, and never saw a stray.
+							Expect(tmpSanitised).to.deep.equal(tmpPlanned);
+							Expect(pResult.Sanitise.Passed).to.equal(true);
+							// The strays are left alone on disk; one warning names them.
+							tmpStrays.forEach((pPath) => { Expect(libFS.existsSync(libPath.join(pResult.PackageDirectory, pPath)), pPath).to.equal(true); });
+							let tmpStrayWarnings = tmpWarnings.filter((pLine) => pLine.indexOf('.DS_Store') >= 0);
+							Expect(tmpStrayWarnings.length, tmpWarnings.join('\n')).to.equal(1);
+							tmpStrays.forEach((pPath) => { Expect(tmpStrayWarnings[0]).to.contain(`"${pPath}"`); });
+						}
+						catch (pAssertError)
+						{
+							return fDone(pAssertError);
+						}
+						tmpStrayLadder.PackageWriter.verifyPackage(pResult.PackageDirectory, pResult.PackageVersion, (pVerifyError, pReport) =>
+							{
+								try
+								{
+									Expect(pVerifyError).to.equal(null);
+									Expect(pReport.Intact, pReport.Problems.join('; ')).to.equal(true);
+								}
+								catch (pAssertError)
+								{
+									return fDone(pAssertError);
+								}
+								let tmpServer = new libFakeServer({ Root: libFS.mkdtempSync(libPath.join(tmpWorkDirectory, 'strays-server-')), Token: tmpToken });
+								tmpServer.start(() =>
+									{
+										tmpStrayLadder.push(pResult.PackageDirectory, { Server: tmpServer.BaseURL, Token: tmpToken }, (pPushError, pPushed) =>
+											{
+												tmpServer.stop(() =>
+													{
+														try
+														{
+															Expect(pPushError).to.equal(null);
+															Expect(pPushed.State).to.equal('ready');
+															Expect(pPushed.UploadedFiles).to.equal(tmpPlanned.length);
+															let tmpLive = tmpServer.liveDirectory(pPushed.AssetGUID, pResult.PackageVersion);
+															Expect(walkFiles(tmpLive, '').filter((pPath) => pPath !== 'package.json' && pPath !== '.ready')).to.deep.equal(tmpPlanned);
+														}
+														catch (pAssertError)
+														{
+															return fDone(pAssertError);
+														}
+														return fDone();
+													});
+											});
+									});
+							});
+					});
+			}
+		);
+
+		test
+		(
+			'a video stream that ends before the poster\'s seek point: no poster.jpg, Poster null, and the package still pushes',
+			(fDone) =>
+			{
+				// 1 s of video in a 30 s container: the poster seeks to 3 s, where there is no frame, so ffmpeg
+				// exits 0 having written nothing.  The package is complete without a poster.
+				let tmpSource = libPath.join(tmpWorkDirectory, 'short-video-long-audio.mp4');
+				ffmpegSync(['-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=30:duration=1', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=30',
+					'-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', tmpSource]);
+				let tmpToken = 'test-token-0123456789abcdef';
+				encodeAndCheck(tmpSource, {}, (pError, pResult, pPackage) =>
+					{
+						if (pError)
+						{
+							return fDone(pError);
+						}
+						let tmpExpected;
+						try
+						{
+							tmpExpected = libPackageWriter.plannedPackageFiles(pResult.Plan).filter((pPath) => pPath !== 'poster.jpg');
+							Expect(pPackage.Poster).to.equal(null);
+							Expect(pPackage.Download).to.equal('download.mp4');
+							Expect(pPackage.Files.map((pFile) => pFile.Path)).to.deep.equal(tmpExpected);
+							Expect(libFS.existsSync(libPath.join(pResult.PackageDirectory, 'poster.jpg'))).to.equal(false);
+							Expect(pResult.Sanitise.Checked).to.not.include('poster.jpg');
+						}
+						catch (pAssertError)
+						{
+							return fDone(pAssertError);
+						}
+						let libFakeServer = require('./support/Fake-Media-Ingest-Server.js');
+						let tmpServer = new libFakeServer({ Root: libFS.mkdtempSync(libPath.join(tmpWorkDirectory, 'no-poster-server-')), Token: tmpToken });
+						tmpServer.start(() =>
+							{
+								tmpLadder.push(pResult.PackageDirectory, { Server: tmpServer.BaseURL, Token: tmpToken }, (pPushError, pPushed) =>
+									{
+										tmpServer.stop(() =>
+											{
+												try
+												{
+													Expect(pPushError).to.equal(null);
+													Expect(pPushed.State).to.equal('ready');
+													Expect(pPushed.UploadedFiles).to.equal(tmpExpected.length);
+													let tmpLive = tmpServer.liveDirectory(pPushed.AssetGUID, pResult.PackageVersion);
+													Expect(walkFiles(tmpLive, '').filter((pPath) => pPath !== 'package.json' && pPath !== '.ready')).to.deep.equal(tmpExpected);
+												}
+												catch (pAssertError)
+												{
+													return fDone(pAssertError);
+												}
+												return fDone();
+											});
+									});
+							});
+					});
+			}
+		);
+
+		test
+		(
 			'cancel: SIGTERM stops ffmpeg, the error is marked Cancelled, the partial is removed',
 			(fDone) =>
 			{
@@ -822,6 +985,129 @@ suite
 							Expect(tmpProgressSeen).to.equal(true);
 							Expect(pError).to.be.an('error');
 							Expect(pError.Cancelled).to.equal(true);
+							Expect(libFS.readdirSync(tmpOutput)).to.deep.equal([]);
+						}
+						catch (pAssertError)
+						{
+							return fDone(pAssertError);
+						}
+						return fDone();
+					});
+			}
+		);
+
+		test
+		(
+			'a cancelled encode never reports 100%: nothing reaches onProgress after the cancel, though ffmpeg flushes progress=end',
+			(fDone) =>
+			{
+				// A stand-in ffmpeg: answers -version, reports progress, and (as ffmpeg does) answers SIGTERM by
+				// flushing a final block marked progress=end before it exits.
+				let tmpStub = libPath.join(tmpWorkDirectory, 'flushing-ffmpeg.js');
+				let tmpFlushed = libPath.join(tmpWorkDirectory, 'flushing-ffmpeg.flushed');
+				libFS.writeFileSync(tmpStub, [
+					`#!${process.execPath}`,
+					"if (process.argv.indexOf('-version') >= 0) { process.stdout.write('ffmpeg version stub-flush-for-tests\\n'); process.exit(0); }",
+					'let tmpUs = 0;',
+					"let tmpTimer = setInterval(() => { tmpUs += 100000; process.stdout.write('out_time_us=' + tmpUs + '\\nprogress=continue\\n'); }, 50);",
+					`process.on('SIGTERM', () => { clearInterval(tmpTimer); require('fs').writeFileSync(${JSON.stringify(tmpFlushed)}, 'end'); process.stdout.write('out_time_us=' + tmpUs + '\\nprogress=end\\n', () => process.exit(255)); });`,
+					''].join('\n'));
+				libFS.chmodSync(tmpStub, 0o755);
+				let tmpOutput = libPath.join(tmpWorkDirectory, 'cancel-flush');
+				let tmpState = { Cancelled: false, Before: [], After: [] };
+				let tmpHandle = new libRetoldMediaLadder({ FFmpegPath: tmpStub }).encode(tmpSources.NoAudio,
+					{
+						OutputDirectory: tmpOutput,
+						onProgress: (pEvent) =>
+						{
+							if (tmpState.Cancelled)
+							{
+								tmpState.After.push(pEvent);
+								return;
+							}
+							tmpState.Before.push(pEvent);
+							if (pEvent.Phase === 'encode' && pEvent.Percent > 0)
+							{
+								tmpState.Cancelled = true;
+								tmpHandle.cancel();
+							}
+						}
+					},
+					(pError) =>
+					{
+						try
+						{
+							Expect(pError).to.be.an('error');
+							Expect(pError.Cancelled).to.equal(true);
+							Expect(tmpState.Cancelled).to.equal(true);
+							Expect(libFS.existsSync(tmpFlushed), 'the stand-in flushed its progress=end block').to.equal(true);
+							Expect(tmpState.After, JSON.stringify(tmpState.After)).to.deep.equal([]);
+							Expect(tmpState.Before.filter((pEvent) => pEvent.Phase === 'encode' && pEvent.Percent >= 100)).to.deep.equal([]);
+							Expect(libFS.readdirSync(tmpOutput)).to.deep.equal([]);
+						}
+						catch (pAssertError)
+						{
+							return fDone(pAssertError);
+						}
+						return fDone();
+					});
+			}
+		);
+
+		test
+		(
+			'the ladder passes nothing on after a cancel, even from a step that keeps reporting',
+			(fDone) =>
+			{
+				// A runner that is slow to stop: after cancel() it still reports 100% before it calls back
+				// cancelled.  The ladder, not only EncodeRunner, keeps that from reaching onProgress.
+				let tmpGuardLadder = new libRetoldMediaLadder({});
+				tmpGuardLadder.EncodeRunner.run = (pArguments, pRunOptions, fCallback) =>
+				{
+					setImmediate(() => pRunOptions.onProgress(10));
+					return (
+						{
+							Process: null,
+							cancel: () =>
+							{
+								setImmediate(() =>
+									{
+										pRunOptions.onProgress(100);
+										fCallback(libTools.cancelledError());
+									});
+								return true;
+							}
+						});
+				};
+				let tmpOutput = libPath.join(tmpWorkDirectory, 'cancel-guard');
+				let tmpState = { Cancelled: false, Before: [], After: [] };
+				let tmpHandle = tmpGuardLadder.encode(tmpSources.NoAudio,
+					{
+						OutputDirectory: tmpOutput,
+						onProgress: (pEvent) =>
+						{
+							if (tmpState.Cancelled)
+							{
+								tmpState.After.push(pEvent);
+								return;
+							}
+							tmpState.Before.push(pEvent);
+							if (pEvent.Phase === 'encode' && pEvent.Percent > 0)
+							{
+								tmpState.Cancelled = true;
+								tmpHandle.cancel();
+							}
+						}
+					},
+					(pError) =>
+					{
+						try
+						{
+							Expect(pError).to.be.an('error');
+							Expect(pError.Cancelled).to.equal(true);
+							Expect(tmpState.Cancelled).to.equal(true);
+							Expect(tmpState.Before[tmpState.Before.length - 1]).to.deep.equal({ Phase: 'encode', Percent: 10, Message: '' });
+							Expect(tmpState.After, JSON.stringify(tmpState.After)).to.deep.equal([]);
 							Expect(libFS.readdirSync(tmpOutput)).to.deep.equal([]);
 						}
 						catch (pAssertError)

@@ -14,7 +14,9 @@
 *     10-bit source tagged SDR warns "possibly D-Log".
 *   - No audio stream -> video-only variants.
 *   - Encoder: x264 `medium` (CRF 21, capped) by default, `Preset` overrides
-*     it, `Fast` uses h264_videotoolbox; `Profile: 'hq'` raises 1080p to 7800k.
+*     it, `Fast` uses h264_videotoolbox (macOS only: the ladder and the CLI
+*     refuse it elsewhere, see fastUnavailableReason); `Profile: 'hq'` raises
+*     1080p to 7800k.
 *
 * The single-pass command scales to the top rung and conforms fps BEFORE the
 * float tone-map, then splits: the expensive colour maths runs once, at the
@@ -57,6 +59,8 @@ const AUDIO_BITRATE = '128k';
 const AUDIO_CHANNELS = 2;
 const POSTER_POSITION = 0.1;
 const DEFAULT_HWACCEL = 'videotoolbox';
+// h264_videotoolbox is VideoToolbox's encoder: macOS only.
+const FAST_ENCODER_PLATFORMS = ['darwin'];
 
 const WARNING_POSSIBLY_DLOG = 'Source is 10-bit but tagged SDR (possibly D-Log); pass --lut <file.cube> to colour-correct it.';
 
@@ -120,12 +124,30 @@ function chooseFirstVariantIndex(pRungs)
 }
 
 /**
+ * Why `Fast` (h264_videotoolbox) cannot encode on a platform, or null when it
+ * can.  The planner never looks at the host -- a plan is the same wherever it
+ * is made -- so the ladder's entry points and the CLI ask this first, and
+ * fail before any probing or hashing. Pure.
+ *
+ * @param {string} pPlatform - a process.platform value
+ * @returns {string|null}
+ */
+function fastUnavailableReason(pPlatform)
+{
+	if (FAST_ENCODER_PLATFORMS.indexOf(pPlatform) >= 0)
+	{
+		return null;
+	}
+	return '--fast uses h264_videotoolbox, which is only available on macOS.';
+}
+
+/**
  * Decide the encode. PURE: no I/O.
  *
  * @param {Object} pSummary - MediaProbe summary
  * @param {Object} [pOptions]
  *   - Preset {string}        x264 preset (default 'medium')
- *   - Fast {boolean}         use h264_videotoolbox
+ *   - Fast {boolean}         use h264_videotoolbox (macOS only; see fastUnavailableReason)
  *   - Profile {string}       'standard' | 'hq'
  *   - SlowMotion {boolean}   stretch high-fps footage to 30 fps
  *   - Lut {string}           absolute path to a .cube file
@@ -547,6 +569,7 @@ module.exports.toneMapChain = toneMapChain;
 module.exports.lutChain = lutChain;
 module.exports.evenScaledLongSide = evenScaledLongSide;
 module.exports.chooseFirstVariantIndex = chooseFirstVariantIndex;
+module.exports.fastUnavailableReason = fastUnavailableReason;
 module.exports.RUNG_TABLE = RUNG_TABLE;
 module.exports.HQ_1080 = HQ_1080;
 module.exports.X264_PRESETS = X264_PRESETS;

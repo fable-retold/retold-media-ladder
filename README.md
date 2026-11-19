@@ -26,8 +26,8 @@ npm install retold-media-ladder
 
 The only npm dependency is `fable-serviceproviderbase`. It needs **ffmpeg and ffprobe 7.x** on `PATH` (or point
 `RETOLD_MEDIA_LADDER_FFMPEG` / `RETOLD_MEDIA_LADDER_FFPROBE`, or the `FFmpegPath` / `FFprobePath` options, at them),
-built with `libx264`, `zscale` (zimg) and `tonemap`; `--fast` and the default decode use VideoToolbox on macOS.
-Homebrew's `ffmpeg` has all of it.
+built with `libx264`, `zscale` (zimg) and `tonemap`; on macOS the default decode and `--fast` (which is macOS-only)
+use VideoToolbox. Homebrew's `ffmpeg` has all of it.
 
 ## Command line
 
@@ -36,13 +36,14 @@ media-ladder probe  <in> [--raw]
 media-ladder plan   <in> [flags]
 media-ladder encode <in> --out <dir> [flags] [--force]
 media-ladder push   <out>/<PackageVersion> [--server URL] [--token T] [push flags]   # see Pushing a package
+media-ladder --version
 ```
 
 | Flag | Meaning |
 |---|---|
 | `--out <dir>` | Packages land at `<dir>/<PackageVersion>/` (built in `<dir>/<PackageVersion>.partial/`, renamed when complete; `<dir>/<PackageVersion>.lock` keeps a second encode of the same package out while one runs). |
 | `--preset <name>` | x264 preset (default `medium`; `ultrafast` … `veryslow`). |
-| `--fast` | Encode with `h264_videotoolbox` instead of x264 (average 80% of each rung's cap). Not always faster -- see **Speed** below. |
+| `--fast` | Encode with `h264_videotoolbox` instead of x264 (average 80% of each rung's cap). macOS only: anywhere else it is a usage error (exit 2). Not always faster -- see **Speed** below. |
 | `--profile hq` | Raise the 1080p cap from 6000k to 7800k. |
 | `--slowmo` | Stretch high-frame-rate footage to 30 fps (every frame shown; audio is dropped). |
 | `--lut <file.cube>` | Apply a 3D LUT (e.g. DJI's D-Log M → Rec.709 cube). D-Log has no tag, so it is never automatic. |
@@ -52,6 +53,7 @@ media-ladder push   <out>/<PackageVersion> [--server URL] [--token T] [push flag
 | `--force` | Rebuild an existing package that fails verification (a missing or changed file, an unreadable `package.json`). An **intact** package is never replaced -- see **Immutability** below. Without `--force`, an identical re-run verifies the finished package and reuses it, and a damaged one is an error. |
 | `--json` | `encode`: print `package.json` instead of the package path. |
 | `--verbose` | Log more. |
+| `-V`, `--version` | Print the version and exit (`0`). |
 
 `encode` prints progress on stderr and the finished package directory on stdout. Exit codes: `0` success, `1`
 failure (including a failed sanitise gate, or another encode of the same package already running), `2` usage error,
@@ -108,7 +110,7 @@ The token is never printed or logged; a plain-`http` server that is not loopback
 <PV>/package.json
 <PV>/master.m3u8              # variants reordered so the 540p rung (or the closest <= 540) is FIRST
 <PV>/v0/index.m3u8  v0/media.mp4   # v0 = top rung ... v3 = bottom rung (fewer when the source is small)
-<PV>/poster.jpg               # JFIF only: no EXIF, no comment
+<PV>/poster.jpg               # JFIF only: no EXIF, no comment (absent when the video ends before ~10% in)
 <PV>/download.mp4             # +faststart stream-copy remux of the top rung (absent with --no-download)
 ```
 
@@ -138,7 +140,11 @@ The token is never printed or logged; a plain-`http` server that is not loopback
   `ShortSide` = min(Width, Height) and names the rung.
 - `Renditions` are top rung first; index *i* is directory `v<i>`. `Bandwidth` / `Codecs` are copied from ffmpeg's
   master playlist (`BANDWIDTH` is ffmpeg's measured peak, audio included).
-- `Poster` / `Download` are `null` when absent. `Files` lists every file in the package except `package.json`.
+- `Poster` / `Download` are `null` when absent: there is no poster when the video stream ends before the poster's
+  seek point (~10% in, so ffmpeg finds no frame there), and no download with `--no-download`. `Files` lists every
+  file in the package except `package.json`:
+  exactly the files the encode produced. A stray `.DS_Store`, `Thumbs.db` or `desktop.ini` that appears in the
+  partial directory is never packaged or pushed.
 - No source file name, capture date, GPS, title or device information appears anywhere in the package.
 - **`PackageVersion`** = the first 8 hex digits of `sha256(stable-JSON(plan) + ffmpeg version line + source
   sha256)`, always `^[0-9a-f]{8}$`. It identifies the **inputs**, not the bytes: the plan is fingerprinted without
@@ -228,7 +234,8 @@ vendor id, a language code and ffmpeg's own `encoder=Lavf…` / `Lavc…` may su
 A generic, resumable upload of one package: **register** it, **upload** whatever the server is missing in raw chunks,
 **commit** (and, only to settle an ambiguous commit answer, read the asset's **status**). `media-ladder push` is the
 client; any server can implement the other side. The push tests run against a small reference server,
-`test/support/Fake-Media-Ingest-Server.js` in this repository.
+[`test/support/Fake-Media-Ingest-Server.js`](https://github.com/fable-retold/retold-media-ladder/blob/main/test/support/Fake-Media-Ingest-Server.js)
+in this repository.
 
 Every route sits under one prefix (`--prefix` / `Prefix`, default `/1.0/MediaIngest`), appended to the server URL's
 own path: `--server https://host/base` puts the register route at `https://host/base/1.0/MediaIngest`. The upload
@@ -355,12 +362,12 @@ pFable.addAndInstantiateServiceType('RetoldMediaLadder', libRetoldMediaLadder);
 let tmpLadder = pFable.RetoldMediaLadder;
 
 // ...or standalone:
-let tmpLadder = new libRetoldMediaLadder({ FFmpegPath: '/opt/homebrew/bin/ffmpeg' });
+// let tmpLadder = new libRetoldMediaLadder({ FFmpegPath: '/opt/homebrew/bin/ffmpeg' });
 
 let tmpHandle = tmpLadder.encode('/footage/DJI_0001.MP4',
 	{
 		OutputDirectory: '/packages',
-		Preset: 'medium',            // or Fast: true
+		Preset: 'medium',            // or Fast: true (macOS only)
 		onProgress: (pEvent) => console.log(pEvent.Phase, pEvent.Percent)
 	},
 	(pError, pResult) =>
@@ -377,7 +384,10 @@ let tmpHandle = tmpLadder.encode('/footage/DJI_0001.MP4',
 | `probe(pInputPath, fCallback)` | `fCallback(pError, pSummary)` -- see `MediaProbe` below. |
 | `plan(pInputPath, pOptions, fCallback)` | `fCallback(pError, { Probe, Plan, Arguments, CommandLine })`, no encode. |
 | `push(pPackageDirectory, pOptions, fCallback)` | `Publisher.publish` (below): returns `{ cancel(), abort() }`. |
-| `encode(pInputPath, pOptions, fCallback)` | Returns `{ cancel(), abort() }`. Options: `OutputDirectory` (required), `Preset`, `Fast`, `Profile` (`'standard'` / `'hq'`), `SlowMotion`, `Lut`, `Download` (default true), `Hwaccel` (default true on macOS), `SegmentSeconds`, `CRF`, `Force` (rebuild a damaged package; never an intact one), `onProgress({ Phase, Percent, Message })`. Phases: `probe`, `hash`, `plan`, `verify` (an existing package), `encode`, `poster`, `download`, `sanitise`, `package`, `done`. Errors may carry `.Cancelled`, `.InProgress` (another live encode holds `<PV>.lock`) or `.PackageExists` (`Force` on an intact package). |
+| `encode(pInputPath, pOptions, fCallback)` | Returns `{ cancel(), abort() }`. Options: `OutputDirectory` (required), `Preset`, `Fast` (macOS only: refused elsewhere, before probing), `Profile` (`'standard'` / `'hq'`), `SlowMotion`, `Lut`, `Download` (default true), `Hwaccel` (default true on macOS), `SegmentSeconds`, `CRF`, `Force` (rebuild a damaged package; never an intact one), `onProgress({ Phase, Percent, Message })` (nothing is reported after `cancel()` or `abort()`). Phases: `probe`, `hash`, `plan`, `verify` (an existing package), `encode`, `poster`, `download`, `sanitise`, `package`, `done`. Errors may carry `.Cancelled`, `.InProgress` (another live encode holds `<PV>.lock`) or `.PackageExists` (`Force` on an intact package). |
+
+The macOS-only parts (`Hwaccel` on by default, `Fast` allowed) follow a ladder's `platform` property, which is
+`process.platform` unless you set it.
 
 ### Services
 
@@ -389,13 +399,13 @@ with `.Cancelled = true`; `pImmediate` means SIGKILL rather than SIGTERM).
 | Service | Job | Pure helpers |
 |---|---|---|
 | `MediaProbe` | `probe(pPath, fCb)` / `probeRaw(pPath, fCb)`: full ffprobe JSON condensed to `{ DurationSeconds, HasVideo, HasAudio, AudioStreamCount, DataStreamCount, Video: { Width, Height, Rotation, DisplayWidth, DisplayHeight, FrameRate, FrameRateValue, PixelFormat, BitDepth, ColorTransfer, ColorPrimaries, ColorSpace, ColorRange, Transfer ('sdr'/'hlg'/'pq'), IsHDR }, Audio, Raw }`. | `summarize(pRaw)`, `normalizeRotation`, `streamRotation`, `streamBitDepth`, `classifyTransfer` |
-| `LadderPlanner` | `plan(pSummary, pOptions)` → the plan; `buildEncodeArguments(pPlan, pInput)`. | `planLadder`, `buildFilterGraph`, `buildPictureChain`, `buildVarStreamMap`, `buildEncodeArguments`, `toneMapChain`, `lutChain`, `evenScaledLongSide`, `chooseFirstVariantIndex`, `formatCommandLine` |
+| `LadderPlanner` | `plan(pSummary, pOptions)` → the plan; `buildEncodeArguments(pPlan, pInput)`. | `planLadder`, `fastUnavailableReason(pPlatform)` (null on macOS, else why `Fast` is refused), `buildFilterGraph`, `buildPictureChain`, `buildVarStreamMap`, `buildEncodeArguments`, `toneMapChain`, `lutChain`, `evenScaledLongSide`, `chooseFirstVariantIndex`, `formatCommandLine` |
 | `EncodeRunner` | `run(pArgs, { Cwd, DurationSeconds, onProgress, KillTimeoutMS }, fCb)` → `{ cancel(pImmediate), Process }` (async spawn, `-progress pipe:1`); `packagePaths` (`{ PackageDirectory, PartialDirectory, LockFile }`), `claimLock`, `releaseLock`, `preparePartial` (claims the lock first), `commitPartial(pOut, pPV, pReplaceDamaged)`, `discardPartial` (releases the lock). | `parseProgressChunk`, `progressSeconds`, `progressPercent`, `readLockOwner`, `lockOwnerIsLive` |
 | `PosterBuilder` | `build(pPlan, pInput, pOutput, fCb)` | `buildPosterArguments` |
 | `DownloadBuilder` | `build(pTopMedia, pOutput, fCb)` | `buildDownloadArguments` |
 | `Sanitiser` | `checkFiles(pDirectory, pRelativePaths, fCb)` → `{ Passed, Violations: [{ File, Where, Key, Value, Reason }], Checked }` | `inspectProbe`, `inspectJpeg`, `inspectPlaylist`, `describeViolations` |
 | `Publisher` | `publish(pPackageDirectory, pOptions, fCb)` → `{ cancel(), abort() }`, the push client (see **Push protocol**). Options: `Server`, `Token` (required), `Prefix`, `Source` (an original's path to hash and probe, or a ready `{ Name, Sha256, Transfer, CaptureDate }`), `Title`, `Description`, `Sensitivity`, `ChunkBytes` (32 MiB), `MinChunkBytes` (8 MiB), `Retries` (5), `BackoffMS` (1000), `MaxBackoffMS` (30000), `SlowChunkMS` (120000), `SocketTimeoutMS` (120000), `CommitTimeoutMS` (1800000), `BusyWaitMS` (360000: how long a busy file -- a `PUT` `409` at the offset `HEAD` reports -- is waited for before the push gives up; `0` gives up at once), `onProgress({ Phase, Path?, Done, Total, Percent, Message })` with phases `verify`, `source`, `register`, `upload` (bytes), `commit`, `done`. Result `{ AssetGUID, PackageVersion, State, UploadedFiles, UploadedBytes, TotalBytes, Source }`. Errors may carry `.Cancelled`, `.Refused` (not a committed `<PV>/`), `.Damaged` + `.Problems`, `.StatusCode` + `.ServerError` (+ `.Errors`), `.Retryable` (gave up; a re-run resumes), `.Oversize` + `.ServerOffset` (the server still held more bytes of a file than it has after the commit should have emptied it), `.LivePackageVersion` (a commit `409` for a version that is not the asset's live one). Constructed with options, `Server` / `Token` / `Prefix` / the tuning keys become per-call defaults. Also `probeSource(pPath, fCb)` → `{ Name, Sha256, Transfer, CaptureDate? }`. | `parseServerURL`, `normalizePrefix`, `encodeUploadPath`, `backoffDelay`, `shrinkChunk`, `isRetryableStatus`, `checkPackageDirectoryName`, `captureDateFromProbe`, `sourceFromProbe`, `normalizeSourceBlock`, `commitRetryPaths`, `parseOffsetHeader`, `printableServerText` |
-| `PackageWriter` | `computePackageVersion(pPlan, pFfmpegVersion, pSourceSha256)`, `reorderMasterFile(pDir, pPlan)` (rebuilds a master missing variants), `measureRungs(pDir, pPlan)`, `verifyPackage(pDir, pPackageVersion, fCb)` → `{ Intact, Problems, Document }`, `hashFiles(pDir, pPaths, fCb)`, `write(pDir, { Plan, PackageVersion, Variants? }, fCb)` | `parseMasterPlaylist`, `reorderMaster`, `parseMediaPlaylist`, `parseByteRange`, `measureBandwidth`, `codecsFromInit`, `buildMasterPlaylist`, `planFingerprint`, `computePackageVersion`, `buildPackageDocument`, `listPackageFiles` |
+| `PackageWriter` | `computePackageVersion(pPlan, pFfmpegVersion, pSourceSha256)`, `reorderMasterFile(pDir, pPlan)` (rebuilds a master missing variants), `measureRungs(pDir, pPlan)`, `verifyPackage(pDir, pPackageVersion, fCb)` → `{ Intact, Problems, Document }`, `hashFiles(pDir, pPaths, fCb)`, `selectPackageFiles(pDir, pPlan)` → the planned files present (a missing one throws, except `poster.jpg`; anything else in the directory is left out, with a warning), `write(pDir, { Plan, PackageVersion, Variants?, FilePaths? }, fCb)` (`FilePaths`: what `selectPackageFiles` returned; selected when absent) | `parseMasterPlaylist`, `reorderMaster`, `parseMediaPlaylist`, `parseByteRange`, `measureBandwidth`, `codecsFromInit`, `buildMasterPlaylist`, `planFingerprint`, `computePackageVersion`, `buildPackageDocument`, `plannedPackageFiles(pPlan)` (the allowlist: `master.m3u8`, each rung's playlist and media, `poster.jpg`, `download.mp4` unless skipped), `listPackageFiles` (everything on disk, strays included) |
 
 ## Tests
 
@@ -405,7 +415,8 @@ npm test
 
 Pure planner / package / sanitiser tests run from ffprobe fixtures. The integration suite synthesises tiny sources
 with ffmpeg lavfi (landscape with audio, native and rotation-tagged portrait, no audio, 10-bit HLG, 100 fps, a 0.3 s
-clip, and a clip carrying location / creation_time / Apple tags), encodes each with `--preset ultrafast`, and checks the
+clip, a clip whose video ends long before its audio (so it gets no poster), and a clip carrying location /
+creation_time / Apple tags), encodes each with `--preset ultrafast`, and checks the
 on-disk contract: every file in `package.json` exists with matching `Bytes` / `Sha256`, the master starts on the
 ≤540 rung, every rung is a single_file fMP4 byte-range playlist with `EXT-X-MAP` → `media.mp4` (no `index.m4s`),
 ffprobe of every output passes the sanitise gate, a portrait top rung is short-side wide, and tone-mapped output is
@@ -414,7 +425,8 @@ damaged one, two concurrent encodes of one package, and cancel / abort in each p
 Ctrl-C). It skips loudly when ffmpeg is not installed.
 
 The push tests run `Publisher` and `media-ladder push` against an in-test fake server
-(`test/support/Fake-Media-Ingest-Server.js`, the server side of the push protocol) with injected
+([`test/support/Fake-Media-Ingest-Server.js`](https://github.com/fable-retold/retold-media-ladder/blob/main/test/support/Fake-Media-Ingest-Server.js),
+the server side of the push protocol) with injected
 faults: a connection dropped mid-chunk, a chunk stored but its answer lost, a wrong offset and a busy file (`409`), a
 `500`, a `413`, a slow chunk, an idle socket, a commit that finds a mismatched or a missing file, and a register that
 names a file outside the package. They prove resume from the last whole chunk, the retry limit and backoff, chunk

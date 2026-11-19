@@ -76,6 +76,9 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 			this.log = this.options.Log || libTools.createFallbackLog(this.options.Verbose);
 		}
 		this.binaries = libTools.resolveBinaries(this.options);
+		// The host OS, for what only macOS has (VideoToolbox decode by default; --fast).
+		// Overridable, so both sides can be tested on one machine.
+		this.platform = process.platform;
 
 		let tmpChildOptions = { FFmpegPath: this.binaries.FFmpeg, FFprobePath: this.binaries.FFprobe, Log: this.log, Verbose: this.options.Verbose };
 		this.MediaProbe = this._createChild(libMediaProbe, tmpChildOptions);
@@ -109,13 +112,31 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 		let tmpOptions = Object.assign({}, pOptions || {});
 		if (typeof tmpOptions.Hwaccel !== 'boolean')
 		{
-			tmpOptions.Hwaccel = (process.platform === 'darwin');
+			tmpOptions.Hwaccel = (this.platform === 'darwin');
 		}
 		if (tmpOptions.Lut)
 		{
 			tmpOptions.Lut = libPath.resolve(tmpOptions.Lut);
 		}
 		return tmpOptions;
+	}
+
+	/**
+	 * The error for `Fast` on a host without VideoToolbox (anything but
+	 * macOS), or null.  The entry points check it before probing or hashing
+	 * anything, so a bad flag fails at once instead of after a long hash.
+	 *
+	 * @param {Object} pOptions - normalised options
+	 * @returns {Error|null}
+	 */
+	_fastPlatformError(pOptions)
+	{
+		if (!pOptions || pOptions.Fast !== true)
+		{
+			return null;
+		}
+		let tmpReason = libLadderPlanner.fastUnavailableReason(this.platform);
+		return tmpReason ? new Error(tmpReason) : null;
 	}
 
 	/**
@@ -148,6 +169,12 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 	{
 		let tmpOptions = this.normalizeOptions(pOptions);
 		let tmpInput = libPath.resolve(String(pInputPath || ''));
+		let tmpFastError = this._fastPlatformError(tmpOptions);
+		if (tmpFastError)
+		{
+			setImmediate(() => fCallback(tmpFastError));
+			return;
+		}
 		this.probe(pInputPath, (pError, pSummary) =>
 			{
 				if (pError)
@@ -224,7 +251,8 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 	 * @param {string} pInputPath
 	 * @param {Object} pOptions
 	 *   - OutputDirectory {string}  REQUIRED: packages land at <OutputDirectory>/<PackageVersion>/
-	 *   - Preset, Fast, Profile, SlowMotion, Lut, Download, Hwaccel, SegmentSeconds, CRF (planner flags)
+	 *   - Preset, Fast, Profile, SlowMotion, Lut, Download, Hwaccel, SegmentSeconds, CRF (planner flags;
+	 *                               Fast is macOS only: elsewhere the encode fails before probing)
 	 *   - Force {boolean}           rebuild an existing package that fails verification (an intact one is
 	 *                               never replaced: delete it to re-encode)
 	 *   - onProgress {function}     ({ Phase, Percent, Message })
@@ -242,6 +270,12 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 
 		let fProgress = (pPhase, pPercent, pMessage) =>
 		{
+			// Nothing more is reported once a cancel or abort is asked for: no step is
+			// finishing (ffmpeg's final block after SIGTERM is not 100%).
+			if (tmpState.Cancelled)
+			{
+				return;
+			}
 			if (typeof tmpOptions.onProgress === 'function')
 			{
 				try
@@ -317,6 +351,12 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 		if (!tmpOutput)
 		{
 			setImmediate(() => fFinish(new Error('encode requires an OutputDirectory.')));
+			return tmpHandle;
+		}
+		let tmpFastError = this._fastPlatformError(tmpOptions);
+		if (tmpFastError)
+		{
+			setImmediate(() => fFinish(tmpFastError));
 			return tmpHandle;
 		}
 
@@ -503,12 +543,20 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 				let tmpTopMedia = libPath.join(tmpContext.Paths.PartialDirectory, tmpContext.Plan.Rungs[0].File);
 				tmpState.Current = this.DownloadBuilder.build(tmpTopMedia, libPath.join(tmpContext.Paths.PartialDirectory, libDownloadBuilder.DOWNLOAD_FILE), (pError) => fNext(pError));
 			},
-			// 9. Sanitise gate.
+			// 9. Sanitise gate, over exactly the files that will be packaged: the
+			//    plan's list (a stray .DS_Store or Thumbs.db is never packaged).
 			(fNext) =>
 			{
 				fProgress('sanitise', 0, 'Checking outputs for metadata');
-				let tmpFiles = libPackageWriter.listPackageFiles(tmpContext.Paths.PartialDirectory);
-				tmpState.Current = this.Sanitiser.checkFiles(tmpContext.Paths.PartialDirectory, tmpFiles, (pError, pReport) =>
+				try
+				{
+					tmpContext.FilePaths = this.PackageWriter.selectPackageFiles(tmpContext.Paths.PartialDirectory, tmpContext.Plan);
+				}
+				catch (pFilesError)
+				{
+					return fNext(pFilesError);
+				}
+				tmpState.Current = this.Sanitiser.checkFiles(tmpContext.Paths.PartialDirectory, tmpContext.FilePaths, (pError, pReport) =>
 					{
 						if (pError)
 						{
@@ -528,7 +576,7 @@ class RetoldMediaLadder extends libFableServiceProviderBase
 			(fNext) =>
 			{
 				fProgress('package', 0, 'Writing package.json');
-				tmpState.Current = this.PackageWriter.write(tmpContext.Paths.PartialDirectory, { Plan: tmpContext.Plan, PackageVersion: tmpContext.PackageVersion, Variants: tmpContext.Variants }, (pError, pDocument) =>
+				tmpState.Current = this.PackageWriter.write(tmpContext.Paths.PartialDirectory, { Plan: tmpContext.Plan, PackageVersion: tmpContext.PackageVersion, Variants: tmpContext.Variants, FilePaths: tmpContext.FilePaths }, (pError, pDocument) =>
 					{
 						tmpContext.Package = pDocument;
 						return fNext(pError);

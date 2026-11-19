@@ -3,7 +3,8 @@
 * progress parsing and the shared tools; plus the package lifecycle pieces
 * that need only a temp directory and a stand-in process (no ffmpeg): the
 * `<PV>.lock` claim, package verification, the master rebuild for sub-0.5 s
-* clips, and the cancel handles.
+* clips, the cancel handles (and no progress after a cancel), and the plan's
+* file list (a stray .DS_Store or Thumbs.db is never packaged).
 *
 * @license MIT
 *
@@ -760,6 +761,295 @@ suite
 								return fDone();
 							});
 						setTimeout(() => { Expect(tmpHandle.cancel()).to.equal(true); }, 150);
+					}
+				);
+
+				test
+				(
+					'a cancelled run reports nothing after the cancel: ffmpeg\'s last progress=end block is not 100%',
+					(fDone) =>
+					{
+						// A stand-in ffmpeg that, as ffmpeg does, answers SIGTERM by flushing a final block marked
+						// progress=end (and exits 255).  Given 'finish', it ends on its own with progress=end, exit 0.
+						let tmpStub = libPath.join(tmpScratch, 'flushing-ffmpeg.js');
+						let tmpFlushed = libPath.join(tmpScratch, 'flushing-ffmpeg.flushed');
+						libFS.writeFileSync(tmpStub, [
+							`#!${process.execPath}`,
+							'let tmpUs = 0;',
+							"let fBlock = (pProgress) => 'out_time_us=' + tmpUs + '\\nprogress=' + pProgress + '\\n';",
+							"if (process.argv.indexOf('finish') >= 0)",
+							'{',
+							"\ttmpUs = 1000000; process.stdout.write(fBlock('continue'));",
+							"\ttmpUs = 10000000; process.stdout.write(fBlock('end'), () => process.exit(0));",
+							'}',
+							'else',
+							'{',
+							"\tlet tmpTimer = setInterval(() => { tmpUs += 100000; process.stdout.write(fBlock('continue')); }, 50);",
+							`\tprocess.on('SIGTERM', () => { clearInterval(tmpTimer); require('fs').writeFileSync(${JSON.stringify(tmpFlushed)}, 'end'); process.stdout.write(fBlock('end'), () => process.exit(255)); });`,
+							'}',
+							''].join('\n'));
+						libFS.chmodSync(tmpStub, 0o755);
+						let tmpRunner = new libEncodeRunner({ FFmpegPath: tmpStub, Log: QUIET_LOG });
+						let tmpPercents = [];
+						let tmpAtCancel = -1;
+						let tmpHandle = tmpRunner.run([], { DurationSeconds: 10,
+							onProgress: (pPercent) =>
+							{
+								tmpPercents.push(pPercent);
+								if (tmpAtCancel < 0)
+								{
+									tmpAtCancel = tmpPercents.length;
+									tmpHandle.cancel();
+								}
+							} },
+							(pError) =>
+							{
+								try
+								{
+									Expect(pError).to.be.an('error');
+									Expect(pError.Cancelled).to.equal(true);
+									Expect(libFS.existsSync(tmpFlushed), 'the stand-in flushed its progress=end block').to.equal(true);
+									Expect(tmpPercents.length, JSON.stringify(tmpPercents)).to.equal(tmpAtCancel);
+									Expect(tmpPercents).to.not.include(100);
+								}
+								catch (pAssertError)
+								{
+									return fDone(pAssertError);
+								}
+								// A run that ends on its own still reports 100 at progress=end.
+								let tmpFinished = [];
+								tmpRunner.run(['finish'], { DurationSeconds: 10, onProgress: (pPercent) => { tmpFinished.push(pPercent); } }, (pFinishError) =>
+									{
+										try
+										{
+											Expect(pFinishError).to.equal(null);
+											Expect(tmpFinished).to.deep.equal([10, 100]);
+										}
+										catch (pAssertError)
+										{
+											return fDone(pAssertError);
+										}
+										return fDone();
+									});
+							});
+					}
+				);
+
+				test
+				(
+					'the package is the plan\'s file list: strays (.DS_Store, Thumbs.db) are never listed or hashed; a missing planned file fails',
+					(fDone) =>
+					{
+						// The allowlist, from the plan alone.
+						let tmpHLG = hlgPlan();
+						Expect(libPackageWriter.plannedPackageFiles(tmpHLG)).to.deep.equal(['download.mp4', 'master.m3u8', 'poster.jpg',
+							'v0/index.m3u8', 'v0/media.mp4', 'v1/index.m3u8', 'v1/media.mp4', 'v2/index.m3u8', 'v2/media.mp4', 'v3/index.m3u8', 'v3/media.mp4']);
+						tmpHLG.Download = false;
+						Expect(libPackageWriter.plannedPackageFiles(tmpHLG)).to.not.include('download.mp4');
+
+						// A finished encode's files (two rungs), plus what Finder and Explorer leave behind.
+						let tmpDirectory = libPath.join(tmpScratch, 'strays');
+						let tmpPlan = { FirstVariantIndex: 1, SegmentSeconds: 6, Download: true, FrameRate: { OutputValue: 30 }, Audio: { Enabled: true }, Rungs: [] };
+						let tmpVariants = [];
+						[['v0', 1280, 720], ['v1', 960, 540]].forEach((pRung) =>
+							{
+								libFS.mkdirSync(libPath.join(tmpDirectory, pRung[0]), { recursive: true });
+								let tmpInit = fakeInit(true);
+								libFS.writeFileSync(libPath.join(tmpDirectory, pRung[0], 'media.mp4'), Buffer.concat([tmpInit, libCrypto.randomBytes(4000)]));
+								libFS.writeFileSync(libPath.join(tmpDirectory, pRung[0], 'index.m3u8'), RUNG_PLAYLIST);
+								tmpPlan.Rungs.push({ Playlist: `${pRung[0]}/index.m3u8`, File: `${pRung[0]}/media.mp4`, Width: pRung[1], Height: pRung[2] });
+								tmpVariants.push({ URI: `${pRung[0]}/index.m3u8`, Bandwidth: 1000000, AverageBandwidth: 0, Width: pRung[1], Height: pRung[2], Codecs: 'avc1.640028,mp4a.40.2' });
+							});
+						libFS.writeFileSync(libPath.join(tmpDirectory, 'master.m3u8'), libPackageWriter.buildMasterPlaylist(['#EXTM3U', '#EXT-X-VERSION:7'], tmpVariants));
+						libFS.writeFileSync(libPath.join(tmpDirectory, 'poster.jpg'), libCrypto.randomBytes(500));
+						libFS.writeFileSync(libPath.join(tmpDirectory, 'download.mp4'), libCrypto.randomBytes(900));
+						let tmpHostile = 'v1/\x1b]0;TITLE\x07evil\u{202e}gpj.exe';
+						let tmpLong = `v1/${'x'.repeat(200)}`;
+						let tmpStrays = ['.DS_Store', 'Thumbs.db', 'v0/.DS_Store', 'v0/Thumbs.db', tmpHostile, tmpLong];
+						tmpStrays.forEach((pPath) => { libFS.writeFileSync(libPath.join(tmpDirectory, pPath), 'stray'); });
+
+						let tmpWarnings = [];
+						let tmpWriter = new libPackageWriter({ Log: Object.assign({}, QUIET_LOG, { warn: (pMessage) => { tmpWarnings.push(String(pMessage)); } }) });
+						let tmpPlanned = libPackageWriter.plannedPackageFiles(tmpPlan);
+						tmpWriter.write(tmpDirectory, { Plan: tmpPlan, PackageVersion: '1a2b3c4d' }, (pError, pDocument) =>
+							{
+								try
+								{
+									Expect(pError).to.equal(null);
+									Expect(pDocument.Files.map((pFile) => pFile.Path)).to.deep.equal(tmpPlanned);
+									Expect(JSON.parse(libFS.readFileSync(libPath.join(tmpDirectory, 'package.json'), 'utf8')).Files).to.deep.equal(pDocument.Files);
+									Expect(pDocument.Poster).to.equal('poster.jpg');
+									Expect(pDocument.Download).to.equal('download.mp4');
+									// Left alone on disk.
+									tmpStrays.forEach((pPath) => { Expect(libFS.existsSync(libPath.join(tmpDirectory, pPath)), pPath).to.equal(true); });
+									// One warning names them, printable (no escape, control or bidi character) and capped.
+									Expect(tmpWarnings.length).to.equal(1);
+									Expect(tmpWarnings[0]).to.contain('6 file(s) the encode did not make are left out of the package');
+									['".DS_Store"', '"Thumbs.db"', '"v0/.DS_Store"', '"v0/Thumbs.db"', '\\u001b]0;TITLE\\u0007evil\\u202egpj.exe'].forEach((pName) => { Expect(tmpWarnings[0]).to.contain(pName); });
+									Expect(/[\x00-\x1f\x7f-\x9f\u{202a}-\u{202e}]/u.test(tmpWarnings[0])).to.equal(false);
+									Expect(tmpWarnings[0]).to.contain(`"v1/${'x'.repeat(117)}"...`);
+									Expect(tmpWarnings[0]).to.not.contain('x'.repeat(118));
+								}
+								catch (pAssertError)
+								{
+									return fDone(pAssertError);
+								}
+								// verifyPackage reads only Files[]: intact, strays and all.
+								tmpWriter.verifyPackage(tmpDirectory, '1a2b3c4d', (pVerifyError, pReport) =>
+									{
+										try
+										{
+											Expect(pVerifyError).to.equal(null);
+											Expect(pReport.Problems).to.deep.equal([]);
+											Expect(pReport.Intact).to.equal(true);
+
+											// Past ten strays the warning names ten, then counts the rest.
+											for (let i = 0; i < 8; i++)
+											{
+												libFS.writeFileSync(libPath.join(tmpDirectory, `junk-${i}.tmp`), 'stray');
+											}
+											Expect(tmpWriter.selectPackageFiles(tmpDirectory, tmpPlan)).to.deep.equal(tmpPlanned);
+											Expect(tmpWarnings.length).to.equal(2);
+											Expect(tmpWarnings[1]).to.contain('14 file(s)').and.to.match(/ and 4 more\.$/);
+											Expect(tmpWarnings[1].match(/(^|, |: )"/g).length).to.equal(10);
+
+											// A planned file that is missing fails, naming it.
+											libFS.rmSync(libPath.join(tmpDirectory, 'v1', 'media.mp4'));
+											Expect(() => tmpWriter.selectPackageFiles(tmpDirectory, tmpPlan)).to.throw('The package is missing v1/media.mp4');
+										}
+										catch (pAssertError)
+										{
+											return fDone(pAssertError);
+										}
+										tmpWriter.write(tmpDirectory, { Plan: tmpPlan, PackageVersion: '1a2b3c4d' }, (pMissingError) =>
+											{
+												try
+												{
+													Expect(pMissingError).to.be.an('error');
+													Expect(pMissingError.message).to.contain('missing v1/media.mp4').and.to.contain('broken');
+												}
+												catch (pAssertError)
+												{
+													return fDone(pAssertError);
+												}
+												return fDone();
+											});
+									});
+							});
+					}
+				);
+
+				test
+				(
+					'poster.jpg is optional: without one the package is written with Poster null; a missing required file is named; an unreadable stray directory costs only a warning',
+					(fDone) =>
+					{
+						// A finished two-rung encode of a source whose video stream ends before the poster's seek
+						// point (~10% in): ffmpeg exited 0 and wrote no poster.jpg.
+						let tmpDirectory = libPath.join(tmpScratch, 'no-poster');
+						let tmpPlan = { FirstVariantIndex: 1, SegmentSeconds: 6, Download: true, FrameRate: { OutputValue: 30 }, Audio: { Enabled: true }, Rungs: [] };
+						let tmpVariants = [];
+						[['v0', 1280, 720], ['v1', 960, 540]].forEach((pRung) =>
+							{
+								libFS.mkdirSync(libPath.join(tmpDirectory, pRung[0]), { recursive: true });
+								libFS.writeFileSync(libPath.join(tmpDirectory, pRung[0], 'media.mp4'), Buffer.concat([fakeInit(true), libCrypto.randomBytes(4000)]));
+								libFS.writeFileSync(libPath.join(tmpDirectory, pRung[0], 'index.m3u8'), RUNG_PLAYLIST);
+								tmpPlan.Rungs.push({ Playlist: `${pRung[0]}/index.m3u8`, File: `${pRung[0]}/media.mp4`, Width: pRung[1], Height: pRung[2] });
+								tmpVariants.push({ URI: `${pRung[0]}/index.m3u8`, Bandwidth: 1000000, AverageBandwidth: 0, Width: pRung[1], Height: pRung[2], Codecs: 'avc1.640028,mp4a.40.2' });
+							});
+						let tmpMasterText = libPackageWriter.buildMasterPlaylist(['#EXTM3U', '#EXT-X-VERSION:7'], tmpVariants);
+						libFS.writeFileSync(libPath.join(tmpDirectory, 'master.m3u8'), tmpMasterText);
+						libFS.writeFileSync(libPath.join(tmpDirectory, 'download.mp4'), libCrypto.randomBytes(900));
+
+						let tmpWarnings = [];
+						let tmpWriter = new libPackageWriter({ Log: Object.assign({}, QUIET_LOG, { warn: (pMessage) => { tmpWarnings.push(String(pMessage)); } }) });
+						let tmpExpected = ['download.mp4', 'master.m3u8', 'v0/index.m3u8', 'v0/media.mp4', 'v1/index.m3u8', 'v1/media.mp4'];
+						Expect(libPackageWriter.plannedPackageFiles(tmpPlan)).to.include('poster.jpg');
+						Expect(tmpWriter.selectPackageFiles(tmpDirectory, tmpPlan)).to.deep.equal(tmpExpected);
+						// A directory named poster.jpg is not a poster.
+						libFS.mkdirSync(libPath.join(tmpDirectory, 'poster.jpg'));
+						Expect(tmpWriter.selectPackageFiles(tmpDirectory, tmpPlan)).to.deep.equal(tmpExpected);
+						libFS.rmdirSync(libPath.join(tmpDirectory, 'poster.jpg'));
+						Expect(tmpWarnings).to.deep.equal([]);
+
+						tmpWriter.write(tmpDirectory, { Plan: tmpPlan, PackageVersion: '1a2b3c4d' }, (pError, pDocument) =>
+							{
+								try
+								{
+									Expect(pError).to.equal(null);
+									Expect(pDocument.Poster).to.equal(null);
+									Expect(pDocument.Download).to.equal('download.mp4');
+									Expect(pDocument.Files.map((pFile) => pFile.Path)).to.deep.equal(tmpExpected);
+									Expect(JSON.parse(libFS.readFileSync(libPath.join(tmpDirectory, 'package.json'), 'utf8')).Poster).to.equal(null);
+									Expect(tmpWarnings).to.deep.equal([]);
+								}
+								catch (pAssertError)
+								{
+									return fDone(pAssertError);
+								}
+								tmpWriter.verifyPackage(tmpDirectory, '1a2b3c4d', (pVerifyError, pReport) =>
+									{
+										let tmpUnreadable = libPath.join(tmpDirectory, 'v1', '.Spotlight-V100');
+										try
+										{
+											Expect(pVerifyError).to.equal(null);
+											Expect(pReport.Intact, pReport.Problems.join('; ')).to.equal(true);
+
+											// Every other planned file is required: download.mp4 only while the plan has one.
+											libFS.renameSync(libPath.join(tmpDirectory, 'download.mp4'), libPath.join(tmpScratch, 'no-poster-download.mp4'));
+											Expect(() => tmpWriter.selectPackageFiles(tmpDirectory, tmpPlan)).to.throw('The package is missing download.mp4: the encode did not make it');
+											Expect(tmpWriter.selectPackageFiles(tmpDirectory, Object.assign({}, tmpPlan, { Download: false })))
+												.to.deep.equal(['master.m3u8', 'v0/index.m3u8', 'v0/media.mp4', 'v1/index.m3u8', 'v1/media.mp4']);
+											libFS.renameSync(libPath.join(tmpScratch, 'no-poster-download.mp4'), libPath.join(tmpDirectory, 'download.mp4'));
+
+											// A stray directory the walk cannot read: the package is the planned files all the same.
+											libFS.mkdirSync(tmpUnreadable);
+											libFS.writeFileSync(libPath.join(tmpUnreadable, 'store.db'), 'stray');
+											libFS.chmodSync(tmpUnreadable, 0o000);
+											let tmpReadable = true;
+											try
+											{
+												libFS.readdirSync(tmpUnreadable);
+											}
+											catch (pReadError)
+											{
+												tmpReadable = false;
+											}
+											Expect(tmpWriter.selectPackageFiles(tmpDirectory, tmpPlan)).to.deep.equal(tmpExpected);
+											Expect(tmpWarnings.length).to.equal(1);
+											// (root reads anything: then the stray is simply named.)
+											Expect(tmpWarnings[0]).to.contain(tmpReadable ? '"v1/.Spotlight-V100/store.db"' : 'could not look through the package directory for stray files (EACCES)');
+										}
+										catch (pAssertError)
+										{
+											return fDone(pAssertError);
+										}
+										finally
+										{
+											if (libFS.existsSync(tmpUnreadable))
+											{
+												libFS.chmodSync(tmpUnreadable, 0o755);
+												libFS.rmSync(tmpUnreadable, { recursive: true });
+											}
+										}
+
+										// write() names a missing master.m3u8 before it tries to read it.
+										libFS.rmSync(libPath.join(tmpDirectory, 'master.m3u8'));
+										tmpWriter.write(tmpDirectory, { Plan: tmpPlan, PackageVersion: '1a2b3c4d' }, (pMissingError) =>
+											{
+												try
+												{
+													Expect(pMissingError).to.be.an('error');
+													Expect(pMissingError.message).to.equal('The package is missing master.m3u8: the encode did not make it, so the package would be broken.');
+												}
+												catch (pAssertError)
+												{
+													return fDone(pAssertError);
+												}
+												return fDone();
+											});
+									});
+							});
 					}
 				);
 			}

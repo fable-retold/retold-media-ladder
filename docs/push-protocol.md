@@ -3,7 +3,9 @@
 A generic, resumable upload of one package: **register** it, **upload** whatever the server is missing in raw chunks,
 **commit** (and, only to settle an ambiguous commit answer, read the asset's **status**). `media-ladder push` (see
 [Pushing a package](push.md)) is the client; any server can implement the other side. The push tests run against a
-small reference server, `test/support/Fake-Media-Ingest-Server.js` in this repository.
+small reference server,
+[`test/support/Fake-Media-Ingest-Server.js`](https://github.com/fable-retold/retold-media-ladder/blob/main/test/support/Fake-Media-Ingest-Server.js)
+in this repository.
 
 Every route sits under one prefix (`--prefix` / `Prefix`, default `/1.0/MediaIngest`), appended to the server URL's
 own path: `--server https://host/base` puts the register route at `https://host/base/1.0/MediaIngest`. The upload

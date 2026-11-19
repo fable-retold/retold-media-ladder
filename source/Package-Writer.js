@@ -6,12 +6,16 @@
 *   1. Reorders `master.m3u8` so the 540p rung (or the closest rung at or
 *      below 540) is FIRST: native Safari and hls.js (startLevel unset) both
 *      start on the first variant, and Apple recommends ~2 Mbps to start.
-*   2. Hashes every file and writes `package.json` -- the one wire contract the
-*      encoder, the server and the player share (see the README):
+*   2. Hashes the package's files and writes `package.json` -- the one wire
+*      contract the encoder, the server and the player share (see the README):
 *      Version, Kind, PackageVersion, DurationMS, displayed Width/Height,
 *      SegmentSeconds, HasAudio, Manifest, Poster, Download, Renditions
 *      (top rung first; BANDWIDTH/CODECS copied from ffmpeg's master), Audio
-*      and Files[] ({Path, Bytes, Sha256} for every file but package.json).
+*      and Files[] ({Path, Bytes, Sha256} for every file the encode made:
+*      master.m3u8, each rung's playlist and media, poster.jpg when ffmpeg
+*      wrote one (Poster is null otherwise) and, unless skipped,
+*      download.mp4 -- the plan's list, never whatever else is in the
+*      directory, such as a .DS_Store a file browser left there).
 *
 * PackageVersion = first 8 hex of sha256(stable-JSON(plan) + ffmpeg version
 * line + source sha256).  It identifies the INPUTS, not the bytes: the plan is
@@ -41,10 +45,20 @@ const libFS = require('node:fs');
 const libPath = require('node:path');
 
 const libTools = require('./Media-Ladder-Tools.js');
+const libPosterBuilder = require('./Poster-Builder.js');
+const libDownloadBuilder = require('./Download-Builder.js');
 
 const PACKAGE_FILE = 'package.json';
 const MASTER_FILE = 'master.m3u8';
 const PACKAGE_DOCUMENT_VERSION = 1;
+// A stray file's name goes into a log line: at most this many names, each cut at this many characters,
+// with anything a terminal acts on (C0, DEL, C1, bidirectional controls, line separators) escaped.
+const MAX_LOGGED_STRAYS = 10;
+const MAX_LOGGED_NAME_CHARACTERS = 120;
+const UNPRINTABLE_NAME_PATTERN = /[\x00-\x1f\x7f-\x9f\u{61c}\u{200e}\u{200f}\u{2028}\u{2029}\u{202a}-\u{202e}\u{2066}-\u{2069}]/gu;
+// Planned files a good encode may still not make: ffmpeg writes no poster (and exits 0) when the video
+// stream ends before the poster's seek point (~10% in), and the package then has Poster: null.
+const OPTIONAL_PACKAGE_FILES = [libPosterBuilder.POSTER_FILE];
 
 /**
  * Parse an HLS attribute list (`A=1,B="x,y",C=z`). Pure.
@@ -350,8 +364,13 @@ function computePackageVersion(pPlan, pFfmpegVersion, pSourceSha256)
 }
 
 /**
- * Every file under a package directory, as sorted POSIX relative paths,
+ * Every regular file under a directory, as sorted POSIX relative paths,
  * excluding package.json. Synchronous; packages hold a dozen files.
+ *
+ * This is what is ON DISK -- dotfiles and strays such as a .DS_Store or
+ * Thumbs.db included -- not the package's file list: that is the plan's
+ * (plannedPackageFiles), which PackageWriter.selectPackageFiles checks
+ * against this listing.
  *
  * @param {string} pDirectory
  * @returns {Array<string>}
@@ -378,6 +397,73 @@ function listPackageFiles(pDirectory)
 	};
 	fWalk(pDirectory, '');
 	return tmpFiles.sort();
+}
+
+/**
+ * The files an encode of this plan makes, as sorted POSIX relative paths
+ * (package.json aside): master.m3u8, each rung's Playlist and File,
+ * poster.jpg, and download.mp4 unless the plan skips it.  This allowlist IS
+ * the package: anything else in the directory (a .DS_Store or Thumbs.db a
+ * file browser wrote while someone looked in) is never listed, hashed,
+ * sanitised or pushed.  Every file on it is required except poster.jpg,
+ * which ffmpeg does not write when the video stream ends before the poster's
+ * seek point (see selectPackageFiles). Pure.
+ *
+ * @param {Object} pPlan
+ * @returns {Array<string>}
+ */
+function plannedPackageFiles(pPlan)
+{
+	let tmpFiles = [MASTER_FILE, libPosterBuilder.POSTER_FILE];
+	if (pPlan.Download)
+	{
+		tmpFiles.push(libDownloadBuilder.DOWNLOAD_FILE);
+	}
+	pPlan.Rungs.forEach((pRung) =>
+		{
+			tmpFiles.push(pRung.Playlist, pRung.File);
+		});
+	return tmpFiles.filter((pPath, pIndex) => tmpFiles.indexOf(pPath) === pIndex).sort();
+}
+
+/**
+ * A file name as it may appear in a log line: quoted, anything a terminal
+ * acts on escaped, cut at MAX_LOGGED_NAME_CHARACTERS (a surrogate pair is
+ * never split; '...' marks the cut). Pure.
+ *
+ * @param {string} pPath
+ * @returns {string}
+ */
+function printableFileName(pPath)
+{
+	let tmpCharacters = Array.from(String(pPath));
+	let tmpQuoted = JSON.stringify(tmpCharacters.slice(0, MAX_LOGGED_NAME_CHARACTERS).join(''));
+	tmpQuoted = tmpQuoted.replace(UNPRINTABLE_NAME_PATTERN, (pCharacter) => `\\u${pCharacter.codePointAt(0).toString(16).padStart(4, '0')}`);
+	return (tmpCharacters.length > MAX_LOGGED_NAME_CHARACTERS) ? `${tmpQuoted}...` : tmpQuoted;
+}
+
+/**
+ * Whether a path is a regular file (not a directory, and not a symbolic link:
+ * listPackageFiles never lists one either).  Absent is false; any other
+ * error (EACCES, say) throws.
+ *
+ * @param {string} pPath
+ * @returns {boolean}
+ */
+function isRegularFile(pPath)
+{
+	try
+	{
+		return libFS.lstatSync(pPath).isFile();
+	}
+	catch (pError)
+	{
+		if (pError.code === 'ENOENT' || pError.code === 'ENOTDIR')
+		{
+			return false;
+		}
+		throw pError;
+	}
 }
 
 /**
@@ -559,6 +645,49 @@ class PackageWriter extends libFableServiceProviderBase
 	}
 
 	/**
+	 * The package's files: the plan's list (plannedPackageFiles), each one
+	 * checked present in pDirectory.  A required file that is missing throws
+	 * (the package would be broken); poster.jpg is optional, and when ffmpeg
+	 * did not write it the package simply has none (Poster: null).  Anything
+	 * else in the directory is left on disk but never listed, so it is never
+	 * hashed, sanitised or pushed; one warning names it.  The planned files
+	 * are checked one by one, so a stray the directory walk cannot read (an
+	 * unreadable subdirectory, say) costs only that warning.
+	 *
+	 * @param {string} pDirectory
+	 * @param {Object} pPlan
+	 * @returns {Array<string>} sorted POSIX relative paths: the planned files present
+	 */
+	selectPackageFiles(pDirectory, pPlan)
+	{
+		let tmpPlanned = plannedPackageFiles(pPlan);
+		let tmpPresent = tmpPlanned.filter((pPath) => isRegularFile(libPath.join(pDirectory, pPath)));
+		let tmpMissing = tmpPlanned.filter((pPath) => (tmpPresent.indexOf(pPath) < 0) && (OPTIONAL_PACKAGE_FILES.indexOf(pPath) < 0));
+		if (tmpMissing.length > 0)
+		{
+			throw new Error(`The package is missing ${tmpMissing.join(', ')}: the encode did not make ${(tmpMissing.length === 1) ? 'it' : 'them'}, so the package would be broken.`);
+		}
+		let tmpOnDisk;
+		try
+		{
+			tmpOnDisk = listPackageFiles(pDirectory);
+		}
+		catch (pListError)
+		{
+			this.log.warn(`PackageWriter: could not look through the package directory for stray files (${pListError.code || 'unreadable'}); only the planned files are packaged all the same.`);
+			return tmpPresent;
+		}
+		let tmpStrays = tmpOnDisk.filter((pPath) => tmpPlanned.indexOf(pPath) < 0);
+		if (tmpStrays.length > 0)
+		{
+			let tmpNames = tmpStrays.slice(0, MAX_LOGGED_STRAYS).map(printableFileName).join(', ');
+			let tmpMore = (tmpStrays.length > MAX_LOGGED_STRAYS) ? ` and ${tmpStrays.length - MAX_LOGGED_STRAYS} more` : '';
+			this.log.warn(`PackageWriter: ${tmpStrays.length} file(s) the encode did not make are left out of the package (they stay on disk, never hashed, sanitised or pushed): ${tmpNames}${tmpMore}.`);
+		}
+		return tmpPresent;
+	}
+
+	/**
 	 * Verify a finished package on disk: package.json parses, is Version 1
 	 * with the expected PackageVersion, and every file in Files[] exists with
 	 * its recorded Bytes and Sha256.
@@ -709,11 +838,13 @@ class PackageWriter extends libFableServiceProviderBase
 	}
 
 	/**
-	 * Reorder the master (unless already done), hash every file and write
-	 * package.json.
+	 * Reorder the master (unless already done), hash the package's files (the
+	 * plan's list: see selectPackageFiles) and write package.json.
 	 *
 	 * @param {string} pDirectory - the package directory being built
-	 * @param {Object} pContext - { Plan, PackageVersion, Variants? }
+	 * @param {Object} pContext - { Plan, PackageVersion, Variants?, FilePaths? } (FilePaths: the
+	 *   list selectPackageFiles returned, e.g. the one the sanitise gate checked; selected here when absent,
+	 *   before anything is read, so a missing file fails with its name)
 	 * @param {function} fCallback - (pError, pPackageDocument)
 	 * @returns {Object} handle { cancel() } (cancels the hashing)
 	 */
@@ -721,8 +852,10 @@ class PackageWriter extends libFableServiceProviderBase
 	{
 		let tmpVariants;
 		let tmpDurationSeconds;
+		let tmpRelativePaths;
 		try
 		{
+			tmpRelativePaths = pContext.FilePaths || this.selectPackageFiles(pDirectory, pContext.Plan);
 			tmpVariants = pContext.Variants || this.reorderMasterFile(pDirectory, pContext.Plan);
 			let tmpTopPlaylist = libFS.readFileSync(libPath.join(pDirectory, pContext.Plan.Rungs[0].Playlist), 'utf8');
 			tmpDurationSeconds = parseMediaPlaylist(tmpTopPlaylist).DurationSeconds;
@@ -733,7 +866,6 @@ class PackageWriter extends libFableServiceProviderBase
 			return libTools.inertHandle();
 		}
 
-		let tmpRelativePaths = listPackageFiles(pDirectory);
 		return this.hashFiles(pDirectory, tmpRelativePaths, (pError, pFiles) =>
 			{
 				if (pError)
@@ -750,8 +882,8 @@ class PackageWriter extends libFableServiceProviderBase
 							Variants: tmpVariants,
 							DurationSeconds: tmpDurationSeconds,
 							Files: pFiles,
-							HasPoster: tmpRelativePaths.indexOf('poster.jpg') >= 0,
-							HasDownload: tmpRelativePaths.indexOf('download.mp4') >= 0
+							HasPoster: tmpRelativePaths.indexOf(libPosterBuilder.POSTER_FILE) >= 0,
+							HasDownload: tmpRelativePaths.indexOf(libDownloadBuilder.DOWNLOAD_FILE) >= 0
 						});
 					libFS.writeFileSync(libPath.join(pDirectory, PACKAGE_FILE), JSON.stringify(tmpDocument, null, '\t') + '\n');
 				}
@@ -776,6 +908,7 @@ module.exports.buildMasterPlaylist = buildMasterPlaylist;
 module.exports.planFingerprint = planFingerprint;
 module.exports.computePackageVersion = computePackageVersion;
 module.exports.listPackageFiles = listPackageFiles;
+module.exports.plannedPackageFiles = plannedPackageFiles;
 module.exports.buildPackageDocument = buildPackageDocument;
 module.exports.PACKAGE_FILE = PACKAGE_FILE;
 module.exports.MASTER_FILE = MASTER_FILE;

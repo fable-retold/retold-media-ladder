@@ -13,7 +13,8 @@
 * server naming files outside the package), that server text is printed
 * safely and that the token never leaks.  Packages are hand-built (they pass verifyPackage); one suite
 * also pushes a real lavfi-encoded package with `--source` probing, and
-* skips loudly when ffmpeg is not installed.
+* skips loudly when ffmpeg is not installed.  The CLI's general behaviour
+* (--version, --help, no command, the macOS-only --fast) is tested here too.
 *
 * @license MIT
 *
@@ -1517,6 +1518,123 @@ suite
 											});
 									});
 							});
+					}
+				);
+			}
+		);
+
+		suite
+		(
+			'the CLI: --version, --help, no arguments and the macOS-only --fast',
+			function ()
+			{
+				/** Run the CLI in a process whose process.platform reads pPlatform (a preload swaps it). */
+				let fRunAs = (pPlatform, pArguments, fCallback) =>
+				{
+					let tmpPreload = libPath.join(tmpScratch, `pretend-${pPlatform}.js`);
+					libFS.writeFileSync(tmpPreload, `Object.defineProperty(process, 'platform', { value: ${JSON.stringify(pPlatform)} });\n`);
+					return libChildProcess.execFile(process.execPath, ['-r', tmpPreload, BIN].concat(pArguments), { env: cleanEnvironment() }, (pError, pStdout, pStderr) =>
+						{
+							return fCallback((pError && typeof pError.code === 'number') ? pError.code : (pError ? -1 : 0), String(pStdout), String(pStderr));
+						});
+				};
+
+				test
+				(
+					'--version and -V print just the version on stdout and exit 0, with or without a command',
+					(fDone) =>
+					{
+						let tmpVersion = require('../package.json').version;
+						let tmpCases = [['--version'], ['-V'], ['encode', '--version'], ['plan', 'in.mp4', '-V'], ['push', '--version']];
+						let fNext = (pIndex) =>
+						{
+							if (pIndex >= tmpCases.length)
+							{
+								return fDone();
+							}
+							runCLI(tmpCases[pIndex], {}, guard(fDone, (pCode, pStdout, pStderr) =>
+								{
+									Expect(pCode, `${tmpCases[pIndex].join(' ')}: ${pStderr}`).to.equal(0);
+									Expect(pStdout).to.equal(`${tmpVersion}\n`);
+									Expect(pStderr).to.equal('');
+									fNext(pIndex + 1);
+								}));
+						};
+						fNext(0);
+					}
+				);
+
+				test
+				(
+					'--help and -h print the usage on stdout and exit 0; no command is a usage error: the usage on stderr, exit 2',
+					(fDone) =>
+					{
+						runCLI(['--help'], {}, guard(fDone, (pCode, pStdout, pStderr) =>
+							{
+								Expect(pCode, pStderr).to.equal(0);
+								Expect(pStderr).to.equal('');
+								Expect(pStdout).to.contain('Usage:');
+								Expect(pStdout.split('\n')).to.include('  --fast                  encode with h264_videotoolbox instead of x264 (macOS only)');
+								Expect(pStdout.split('\n')).to.include('  -V, --version           print the version and exit');
+								runCLI(['encode', '-h'], {}, guard(fDone, (pHelpCode, pHelpStdout, pHelpStderr) =>
+									{
+										Expect(pHelpCode, pHelpStderr).to.equal(0);
+										Expect(pHelpStdout).to.equal(pStdout);
+										Expect(pHelpStderr).to.equal('');
+										runCLI([], {}, guard(fDone, (pBareCode, pBareStdout, pBareStderr) =>
+											{
+												Expect(pBareCode).to.equal(2);
+												Expect(pBareStdout).to.equal('');
+												Expect(pBareStderr).to.equal(pStdout);
+												runCLI(['--verbose'], {}, guard(fDone, (pFlagsCode, pFlagsStdout, pFlagsStderr) =>
+													{
+														Expect(pFlagsCode).to.equal(2);
+														Expect(pFlagsStdout).to.equal('');
+														Expect(pFlagsStderr).to.equal(pStdout);
+														fDone();
+													}));
+											}));
+									}));
+							}));
+					}
+				);
+
+				test
+				(
+					'--fast is a usage error (exit 2) anywhere but macOS, before any probing; on macOS it is accepted',
+					(fDone) =>
+					{
+						let libCLI = require('../bin/media-ladder.js');
+						let tmpReason = '--fast uses h264_videotoolbox, which is only available on macOS.';
+						Expect(() => libCLI.ladderOptions({ '--fast': true }, 'linux')).to.throw(tmpReason);
+						Expect(() => libCLI.ladderOptions({ '--fast': true }, 'win32')).to.throw(tmpReason);
+						Expect(libCLI.ladderOptions({ '--fast': true, '--out': 'packages' }, 'darwin')).to.deep.equal({ Fast: true, OutputDirectory: 'packages' });
+						Expect(libCLI.ladderOptions({ '--out': 'packages' }, 'linux')).to.deep.equal({ OutputDirectory: 'packages' });
+
+						let tmpOutput = libPath.join(tmpScratch, 'fast-out');
+						let tmpMissing = libPath.join(tmpScratch, 'no-such-source.mp4');
+						fRunAs('linux', ['encode', tmpMissing, '--out', tmpOutput, '--fast'], guard(fDone, (pCode, pStdout, pStderr) =>
+							{
+								Expect(pCode, pStderr).to.equal(2);
+								Expect(pStderr).to.equal(`media-ladder: ${tmpReason}\n`);
+								Expect(pStdout).to.equal('');
+								Expect(libFS.existsSync(tmpOutput)).to.equal(false);
+								fRunAs('win32', ['plan', tmpMissing, '--fast'], guard(fDone, (pPlanCode, pPlanStdout, pPlanStderr) =>
+									{
+										Expect(pPlanCode, pPlanStderr).to.equal(2);
+										Expect(pPlanStderr).to.equal(`media-ladder: ${tmpReason}\n`);
+										Expect(pPlanStdout).to.equal('');
+										// On macOS the flag passes: the run gets as far as the (missing) source.
+										fRunAs('darwin', ['plan', tmpMissing, '--fast'], guard(fDone, (pMacCode, pMacStdout, pMacStderr) =>
+											{
+												Expect(pMacCode, pMacStderr).to.equal(1);
+												Expect(pMacStderr).to.contain('Input file not found');
+												Expect(pMacStderr).to.not.contain('only available on macOS');
+												Expect(pMacStdout).to.equal('');
+												fDone();
+											}));
+									}));
+							}));
 					}
 				);
 			}

@@ -2,6 +2,8 @@
 * Unit tests for the pure probe summary and the LadderPlanner.
 *
 * Driven entirely by ffprobe JSON fixtures in test/fixtures/ -- no ffmpeg runs.
+* Also the macOS-only `Fast` check at the ladder's entry points (the probe
+* stubbed with a fixture, the host platform overridden).
 *
 * @license MIT
 *
@@ -372,6 +374,131 @@ suite
 						Expect(libLadderPlanner.chooseFirstVariantIndex([{ ShortSide: 1080 }, { ShortSide: 720 }, { ShortSide: 540 }, { ShortSide: 360 }])).to.equal(2);
 						Expect(libLadderPlanner.chooseFirstVariantIndex([{ ShortSide: 720 }, { ShortSide: 360 }])).to.equal(1);
 						Expect(libLadderPlanner.chooseFirstVariantIndex([{ ShortSide: 720 }])).to.equal(0);
+					}
+				);
+			}
+		);
+
+		suite
+		(
+			'Fast is macOS-only',
+			() =>
+			{
+				let libTools = require('../source/Media-Ladder-Tools.js');
+				let tmpRealSha256File = libTools.sha256File;
+
+				// The refusal test counts hashes by wrapping the shared helper: put it back even when that test
+				// fails or times out, so no later suite hashes through the wrapper.
+				teardown
+				(
+					() =>
+					{
+						libTools.sha256File = tmpRealSha256File;
+					}
+				);
+
+				test
+				(
+					'fastUnavailableReason: null on macOS, the same clear reason anywhere else; the plan never looks at the host',
+					() =>
+					{
+						Expect(libLadderPlanner.fastUnavailableReason('darwin')).to.equal(null);
+						['linux', 'win32', 'freebsd'].forEach((pPlatform) =>
+							{
+								Expect(libLadderPlanner.fastUnavailableReason(pPlatform), pPlatform).to.equal('--fast uses h264_videotoolbox, which is only available on macOS.');
+							});
+						Expect(libLadderPlanner.planLadder(loadSummary('source-720p'), { Fast: true }).Video.Encoder).to.equal('h264_videotoolbox');
+					}
+				);
+
+				test
+				(
+					'encode and plan refuse Fast off macOS before probing or hashing anything; on macOS they go ahead',
+					(fDone) =>
+					{
+						let libRetoldMediaLadder = require('../source/Retold-Media-Ladder.js');
+						let fQuiet = () => {};
+						let tmpQuietLog = { trace: fQuiet, debug: fQuiet, info: fQuiet, warn: fQuiet, error: fQuiet };
+						let tmpReason = '--fast uses h264_videotoolbox, which is only available on macOS.';
+						let tmpCalls = { Probe: 0, Hash: 0, Phases: [] };
+						let tmpOutput = libPath.join(require('node:os').tmpdir(), `retold-media-ladder-fast-${process.pid}-${Date.now()}`);
+						let tmpMissing = libPath.join(tmpOutput, 'no-such-source.mp4');
+
+						// Count every hash (teardown puts the helper back); probe from a fixture (the source does not exist).
+						libTools.sha256File = function ()
+						{
+							tmpCalls.Hash++;
+							return tmpRealSha256File.apply(null, arguments);
+						};
+						let fFinish = (pError) => fDone(pError);
+						let fLadder = (pPlatform) =>
+						{
+							let tmpLadder = new libRetoldMediaLadder({ Log: tmpQuietLog });
+							Expect(tmpLadder.platform).to.equal(process.platform);
+							tmpLadder.platform = pPlatform;
+							tmpLadder.probe = (pInputPath, fCallback) =>
+							{
+								tmpCalls.Probe++;
+								setImmediate(() => fCallback(null, loadSummary('source-720p')));
+								return libTools.inertHandle();
+							};
+							return tmpLadder;
+						};
+						let fGuard = (fBody) =>
+						{
+							return function ()
+							{
+								try
+								{
+									return fBody.apply(null, arguments);
+								}
+								catch (pAssertError)
+								{
+									return fFinish(pAssertError);
+								}
+							};
+						};
+
+						fLadder('linux').encode(tmpMissing, { OutputDirectory: tmpOutput, Fast: true, onProgress: (pEvent) => tmpCalls.Phases.push(pEvent.Phase) }, fGuard((pError) =>
+							{
+								Expect(pError).to.be.an('error');
+								Expect(pError.message).to.equal(tmpReason);
+								Expect(tmpCalls).to.deep.equal({ Probe: 0, Hash: 0, Phases: [] });
+								Expect(require('node:fs').existsSync(tmpOutput)).to.equal(false);
+
+								fLadder('win32').plan(tmpMissing, { Fast: true }, fGuard((pPlanError) =>
+									{
+										Expect(pPlanError.message).to.equal(tmpReason);
+										Expect(tmpCalls.Probe).to.equal(0);
+
+										// Off macOS without Fast: x264, and the decode default is software.
+										fLadder('linux').plan(tmpMissing, {}, fGuard((pX264Error, pX264) =>
+											{
+												Expect(pX264Error).to.equal(null);
+												Expect(tmpCalls.Probe).to.equal(1);
+												Expect(pX264.Plan.Video.Encoder).to.equal('libx264');
+												Expect(pX264.Plan.Decode.Hwaccel).to.equal(null);
+
+												fLadder('darwin').plan(tmpMissing, { Fast: true }, fGuard((pMacError, pMac) =>
+													{
+														Expect(pMacError).to.equal(null);
+														Expect(tmpCalls.Probe).to.equal(2);
+														Expect(pMac.Plan.Video.Encoder).to.equal('h264_videotoolbox');
+														Expect(pMac.Plan.Decode.Hwaccel).to.equal('videotoolbox');
+
+														// On macOS an encode gets past the check: it probes, then fails hashing the missing source.
+														fLadder('darwin').encode(tmpMissing, { OutputDirectory: tmpOutput, Fast: true }, fGuard((pMacEncodeError) =>
+															{
+																Expect(pMacEncodeError).to.be.an('error');
+																Expect(pMacEncodeError.message).to.not.contain('only available on macOS');
+																Expect(tmpCalls.Probe).to.equal(3);
+																Expect(tmpCalls.Hash).to.equal(1);
+																return fFinish();
+															}));
+													}));
+											}));
+									}));
+							}));
 					}
 				);
 			}

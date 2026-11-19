@@ -1,7 +1,7 @@
 {
   "name": "retold-media-ladder",
   "version": "1.0.0",
-  "description": "Turn a video file into a private, adaptive-bitrate HLS package: probe, plan, one-pass ffmpeg encode (fMP4 single_file H.264 rungs, HLG/PQ tone-map, LUT, fps conform, portrait-aware), poster, faststart download, a metadata sanitise gate and a hashed package.json.",
+  "description": "Turn a video file into a private, adaptive-bitrate HLS package, and push it to a media-ingest server.",
   "main": "source/Retold-Media-Ladder.js",
   "bin": {
     "media-ladder": "./bin/media-ladder.js"
@@ -44,7 +44,14 @@
     "video",
     "encoding",
     "tone-mapping",
-    "hlg"
+    "hlg",
+    "push",
+    "upload",
+    "resumable-upload",
+    "media-ingest",
+    "cli",
+    "hdr",
+    "pq"
   ],
   "author": "steven velozo <steven@velozo.com>",
   "license": "MIT",

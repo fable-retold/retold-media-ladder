@@ -7,8 +7,9 @@
 *   media-ladder encode <in> --out <dir> [flags] [--force]
 *   media-ladder push   <packageDir> [push flags]
 *
-* Flags: --preset <x264 preset>  --fast  --profile hq  --slowmo  --lut <file.cube>
-*        --no-download  --no-hwaccel  --segment-seconds <n>  --json  --verbose
+* Flags: --preset <x264 preset>  --fast (macOS only)  --profile hq  --slowmo
+*        --lut <file.cube>  --no-download  --no-hwaccel  --segment-seconds <n>
+*        --json  --verbose  (-h / --help prints the usage, -V / --version the version)
 * Push:  --server <URL>  --token <T>  --prefix <path>  --source <original>
 *        --title <T>  --description <D>  --sensitivity normal|conversation
 *        --chunk-mib <n>  --retries <n>  --json  (env MEDIA_LADDER_SERVER /
@@ -45,7 +46,7 @@ Usage:
 Flags:
   --out <dir>             where packages go: <dir>/<PackageVersion>/
   --preset <name>         x264 preset (default medium; e.g. ultrafast, slow)
-  --fast                  encode with h264_videotoolbox instead of x264
+  --fast                  encode with h264_videotoolbox instead of x264 (macOS only)
   --profile hq            raise the 1080p cap from 6000k to 7800k
   --slowmo                stretch high-frame-rate footage to 30 fps (drops audio)
   --lut <file.cube>       apply a 3D LUT (DJI D-Log M -> Rec.709)
@@ -58,6 +59,7 @@ Flags:
                           push: print the result JSON instead of "<AssetGUID> <PackageVersion>"
   --verbose               log more
   -h, --help              this text
+  -V, --version           print the version and exit
 
 Push flags (push a finished <out>/<PackageVersion>/ to a server; resumable):
   --server <URL>          the server (default $MEDIA_LADDER_SERVER)
@@ -80,9 +82,9 @@ Push flags (push a finished <out>/<PackageVersion>/ to a server; resumable):
 
 const PUSH_VALUE_FLAGS = ['--server', '--token', '--prefix', '--source', '--title', '--description', '--sensitivity', '--chunk-mib', '--retries'];
 const VALUE_FLAGS = ['--out', '--preset', '--profile', '--lut', '--segment-seconds'].concat(PUSH_VALUE_FLAGS);
-const BOOLEAN_FLAGS = ['--fast', '--slowmo', '--no-download', '--no-hwaccel', '--force', '--json', '--raw', '--verbose', '--help', '-h'];
+const BOOLEAN_FLAGS = ['--fast', '--slowmo', '--no-download', '--no-hwaccel', '--force', '--json', '--raw', '--verbose', '--help', '-h', '--version', '-V'];
 // Everything push accepts; every other flag belongs to probe / plan / encode.
-const PUSH_FLAGS = PUSH_VALUE_FLAGS.concat(['--json', '--verbose', '--help', '-h']);
+const PUSH_FLAGS = PUSH_VALUE_FLAGS.concat(['--json', '--verbose', '--help', '-h', '--version', '-V']);
 const MAX_CHUNK_MIB = 1024;
 const MIB = 1048576;
 
@@ -127,12 +129,14 @@ function parseArguments(pArguments)
 }
 
 /**
- * Map CLI flags to ladder options.
+ * Map CLI flags to ladder options. Throws on bad usage, including --fast
+ * anywhere but macOS (h264_videotoolbox is VideoToolbox's encoder).
  *
  * @param {Object} pFlags
+ * @param {string} [pPlatform] - default process.platform
  * @returns {Object}
  */
-function ladderOptions(pFlags)
+function ladderOptions(pFlags, pPlatform)
 {
 	let tmpOptions = {};
 	if (pFlags['--preset'])
@@ -141,6 +145,11 @@ function ladderOptions(pFlags)
 	}
 	if (pFlags['--fast'])
 	{
+		let tmpUnavailable = libRetoldMediaLadder.LadderPlanner.fastUnavailableReason(pPlatform || process.platform);
+		if (tmpUnavailable)
+		{
+			throw new Error(tmpUnavailable);
+		}
 		tmpOptions.Fast = true;
 	}
 	if (pFlags['--profile'])
@@ -281,10 +290,23 @@ function main(pArguments)
 		return;
 	}
 
-	if (tmpParsed.Flags['--help'] || tmpParsed.Flags['-h'] || !tmpParsed.Command)
+	if (tmpParsed.Flags['--version'] || tmpParsed.Flags['-V'])
+	{
+		process.stdout.write(`${libPackage.version}\n`);
+		process.exitCode = EXIT_OK;
+		return;
+	}
+	if (tmpParsed.Flags['--help'] || tmpParsed.Flags['-h'])
 	{
 		process.stdout.write(USAGE);
-		process.exitCode = tmpParsed.Command ? EXIT_OK : ((tmpParsed.Flags['--help'] || tmpParsed.Flags['-h']) ? EXIT_OK : EXIT_USAGE);
+		process.exitCode = EXIT_OK;
+		return;
+	}
+	if (!tmpParsed.Command)
+	{
+		// No command is a usage error: the usage goes to stderr, like every other one.
+		process.stderr.write(USAGE);
+		process.exitCode = EXIT_USAGE;
 		return;
 	}
 	if (['probe', 'plan', 'encode', 'push'].indexOf(tmpParsed.Command) < 0)

@@ -194,7 +194,7 @@ class EncodeRunner extends libFableServiceProviderBase
 	 * @param {Object} [pRunOptions]
 	 *   - Cwd {string}               working directory (relative outputs land here)
 	 *   - DurationSeconds {number}   expected OUTPUT duration, for the percentage
-	 *   - onProgress {function}      (pPercent, pBlock) at each progress report
+	 *   - onProgress {function}      (pPercent, pBlock) at each progress report; none after a cancel
 	 *   - KillTimeoutMS {number}     SIGTERM -> SIGKILL grace (default 5000)
 	 * @param {function} fCallback - (pError, { Code, Stderr }); a cancel yields an Error with `.Cancelled = true`
 	 * @returns {Object} handle { cancel(pImmediate), Process }
@@ -238,7 +238,9 @@ class EncodeRunner extends libFableServiceProviderBase
 			{
 				tmpState.Carry = parseProgressChunk(tmpState.Carry, pChunk, (pBlock) =>
 					{
-						if (typeof tmpRunOptions.onProgress !== 'function')
+						// ffmpeg answers SIGTERM by flushing a last block marked progress=end; after a
+						// cancel that is not a finished encode, so nothing more is reported.
+						if (tmpState.Cancelled || typeof tmpRunOptions.onProgress !== 'function')
 						{
 							return;
 						}
